@@ -294,6 +294,18 @@ final class HoverView: NSView {
         return f.localizedString(for: d, relativeTo: Date())
     }
 
+    /// The first line after the title, for the ⌘P list.
+    private func preview(_ body: String) -> String {
+        let lines = body.split(whereSeparator: { $0 == "\n" || $0 == "\u{2028}" })
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard lines.count > 1 else { return lines.isEmpty ? "Empty note" : " " }
+        var line = lines[1].trimmingCharacters(in: CharacterSet(charactersIn: "#>-*[] \t"))
+        // Plain text: [text](url) → text, and drop ** * ~~ ` <u> markers.
+        line = line.replacingOccurrences(of: #"\[([^\]]*)\]\([^)]*\)"#, with: "$1", options: .regularExpression)
+        line = line.replacingOccurrences(of: #"</?u>|[*~`]+|(?<!\w)_|_(?!\w)"#, with: "", options: .regularExpression)
+        return line
+    }
+
     private func showBrowser() {
         guard let note else { return }
         note.saveNow()
@@ -305,11 +317,11 @@ final class HoverView: NSView {
         for (i, id) in pins.enumerated() {
             guard let n = byID[id] ?? NotesLibrary.info(for: id) else { continue }
             let key = i < pinActions.count ? Keymap.shared.shortcut(pinActions[i]) : ""
-            items.append(.init(title: "📌 " + n.title, detail: key, searchText: n.body) { [weak self] in self?.switchTo(id) })
+            items.append(.init(title: "📌 " + n.title, subtitle: preview(n.body), detail: key, searchText: n.body) { [weak self] in self?.switchTo(id) })
         }
         for n in notes where !pins.contains(n.id) {
-            let current = n.id == note.noteID ? "current · " : ""
-            items.append(.init(title: n.title, detail: current + relative(n.modified), searchText: n.body) { [weak self] in
+            let current = (n.id == note.noteID ? "current · " : "") + (n.id.contains("-conflict-") ? "conflict copy · " : "")
+            items.append(.init(title: n.title, subtitle: preview(n.body), detail: current + relative(n.modified), searchText: n.body) { [weak self] in
                 self?.switchTo(n.id)
             })
         }
@@ -492,6 +504,16 @@ final class HoverView: NSView {
             }
             for c in Store.load() { open(c) }
             if stickies.isEmpty { newClaudeHere(folder: NSHomeDirectory() + "/Documents") }
+            // Debug: STICKY_DEBUG_BROWSE=1 opens the ⌘P note switcher on launch.
+            if ProcessInfo.processInfo.environment["STICKY_DEBUG_BROWSE"] != nil, let n = noteStickies.first {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    n.show()
+                    n.perform(.browseNotes)
+                    if let path = ProcessInfo.processInfo.environment["STICKY_DEBUG_SNAPSHOT"] {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { QuickPicker.shared.snapshot(to: path) }
+                    }
+                }
+            }
         }
     }
 

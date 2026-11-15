@@ -4,6 +4,7 @@ import AppKit
 @MainActor final class QuickPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate, NSWindowDelegate {
     struct Item {
         var title: String
+        var subtitle: String = ""  // second line (a note's preview); empty = one-line row
         var detail: String = ""
         var searchText: String = ""
         var run: () -> Void
@@ -11,7 +12,7 @@ import AppKit
 
     static let shared = QuickPicker()
 
-    private let size = NSSize(width: 480, height: 360)
+    private let size = NSSize(width: 600, height: 420)
     private var panel: StickyPanel!
     private let field = NSTextField()
     private let table = NSTableView()
@@ -67,13 +68,13 @@ import AppKit
         scroll.autohidesScrollers = true
         let col = NSTableColumn(identifier: .init("main"))
         col.resizingMask = .autoresizingMask
+        col.width = size.width - 24
         table.addTableColumn(col)
         table.headerView = nil
-        table.rowHeight = 30
         table.backgroundColor = .clear
         table.style = .inset
         table.intercellSpacing = NSSize(width: 0, height: 2)
-        table.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+        table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle  // the one column fills the width
         table.dataSource = self
         table.delegate = self
         table.target = self
@@ -109,6 +110,13 @@ import AppKit
         panel.makeFirstResponder(field)
     }
 
+    /// Debug: saves a PNG of the picker (works even if it isn't the focused window).
+    func snapshot(to path: String) {
+        guard let view = panel.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+        view.cacheDisplay(in: view.bounds, to: rep)
+        try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+    }
+
     private func dismiss() {
         guard panel.isVisible else { return }
         panel.orderOut(nil)
@@ -128,6 +136,7 @@ import AppKit
             if let e = extra?(field.stringValue.trimmingCharacters(in: .whitespaces)) { shown.append(e) }
         }
         table.reloadData()
+        table.sizeLastColumnToFit()
         if !shown.isEmpty { table.selectRowIndexes([0], byExtendingSelection: false); table.scrollRowToVisible(0) }
     }
 
@@ -167,26 +176,52 @@ import AppKit
     // Table
     func numberOfRows(in tableView: NSTableView) -> Int { shown.count }
 
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        shown[row].subtitle.isEmpty ? 32 : 46
+    }
+
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let item = shown[row]
         let v = NSView()
         let t = NSTextField(labelWithString: item.title)
-        t.font = .systemFont(ofSize: 14)
+        t.font = .systemFont(ofSize: 14, weight: .medium)
         t.lineBreakMode = .byTruncatingTail
         let d = NSTextField(labelWithString: item.detail)
-        d.font = .systemFont(ofSize: 12)
+        d.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         d.textColor = .secondaryLabelColor
         d.alignment = .right
-        for f in [t, d] { f.translatesAutoresizingMaskIntoConstraints = false; v.addSubview(f) }
-        t.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        var fields = [t, d]
+        let sub = NSTextField(labelWithString: item.subtitle)
+        if !item.subtitle.isEmpty {
+            sub.font = .systemFont(ofSize: 12)
+            sub.textColor = .secondaryLabelColor
+            sub.lineBreakMode = .byTruncatingTail
+            fields.append(sub)
+        }
+        for f in fields {
+            f.translatesAutoresizingMaskIntoConstraints = false
+            f.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            v.addSubview(f)
+        }
         d.setContentCompressionResistancePriority(.required, for: .horizontal)
-        NSLayoutConstraint.activate([
-            t.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 8),
-            t.centerYAnchor.constraint(equalTo: v.centerYAnchor),
-            d.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -8),
-            d.centerYAnchor.constraint(equalTo: v.centerYAnchor),
-            t.trailingAnchor.constraint(lessThanOrEqualTo: d.leadingAnchor, constant: -10),
-        ])
+        d.setContentHuggingPriority(.required, for: .horizontal)
+        var c = [
+            t.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 10),
+            d.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -10),
+            t.trailingAnchor.constraint(lessThanOrEqualTo: d.leadingAnchor, constant: -12),
+            d.firstBaselineAnchor.constraint(equalTo: t.firstBaselineAnchor),
+        ]
+        if item.subtitle.isEmpty {
+            c.append(t.centerYAnchor.constraint(equalTo: v.centerYAnchor))
+        } else {
+            c += [
+                t.topAnchor.constraint(equalTo: v.topAnchor, constant: 5),
+                sub.topAnchor.constraint(equalTo: t.bottomAnchor, constant: 1),
+                sub.leadingAnchor.constraint(equalTo: t.leadingAnchor),
+                sub.trailingAnchor.constraint(lessThanOrEqualTo: v.trailingAnchor, constant: -10),
+            ]
+        }
+        NSLayoutConstraint.activate(c)
         return v
     }
 }
