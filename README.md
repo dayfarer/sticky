@@ -38,6 +38,12 @@ All of these can be changed (see **Keybindings** below).
 
 Every shortcut lives in `~/.config/sticky/keybindings.json` (menu bar → **Edit Keybindings…**). Write keys like `"cmd+shift+p"`, `"ctrl+tab"` or `"opt+shift+up"`. Use `""` to turn one off, or a list like `["cmd+p", "cmd+o"]` for several. Changes apply as soon as you save.
 
+## Extensions (web stickies)
+
+Web stickies can run browser extensions through Apple's WebExtension support (macOS 15.4+). Menu bar → **Add Extension…** and pick an unpacked extension folder, a `.zip` (like GitHub's *Download ZIP*), or a `.crx`. Extensions live in `~/.config/sticky/extensions/`; delete a folder and relaunch to remove one. Each extension with a popup gets a menu item that opens its settings.
+
+Simple extensions that restyle or tweak pages work well (for example [Better Canvas](https://github.com/UseBetterCanvas/bettercanvas)). Extensions that talk to a desktop app, like password managers, won't.
+
 ## Requirements
 
 - macOS 14 or later

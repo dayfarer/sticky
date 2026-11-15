@@ -320,7 +320,9 @@ final class HoverView: NSView {
     }
 
     private func setUpWeb(in container: NSView) {
-        let w = WKWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
+        let cfg = WKWebViewConfiguration()
+        if #available(macOS 15.4, *) { cfg.webExtensionController = ExtensionHost.shared.controller }
+        let w = WKWebView(frame: container.bounds, configuration: cfg)
         w.autoresizingMask = [.width, .height]
         w.allowsBackForwardNavigationGestures = true
         w.uiDelegate = self
@@ -445,8 +447,15 @@ final class HoverView: NSView {
         }
         enableLoginOnFirstRun()
 
-        for c in Store.load() { open(c) }
-        if stickies.isEmpty { newClaudeHere(folder: NSHomeDirectory() + "/Documents") }
+        // Load extensions first, so web stickies get them from the first page load.
+        Task { @MainActor in
+            if #available(macOS 15.4, *) {
+                await ExtensionHost.shared.loadAll()
+                buildStatusMenu()
+            }
+            for c in Store.load() { open(c) }
+            if stickies.isEmpty { newClaudeHere(folder: NSHomeDirectory() + "/Documents") }
+        }
     }
 
     // Menu bar icon
@@ -467,6 +476,23 @@ final class HoverView: NSView {
         add(m, "New Claude CLI Sticky…", #selector(newClaude))
         add(m, "New Terminal Sticky…", #selector(newTerminal))
         add(m, "New Web Sticky…", #selector(newWeb))
+        m.addItem(.separator())
+        if #available(macOS 15.4, *) {
+            let host = ExtensionHost.shared
+            host.anchor = statusItem.button
+            let header = NSMenuItem(title: "Extensions", action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            m.addItem(header)
+            for ctx in host.contexts where host.hasPopup(ctx) {
+                let item = NSMenuItem(title: "   \(host.name(ctx))…", action: #selector(openExtension(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = ctx
+                item.image = ctx.webExtension.icon(for: NSSize(width: 16, height: 16))
+                m.addItem(item)
+            }
+            add(m, "   Add Extension…", #selector(addExtension))
+            add(m, "   Open Extensions Folder", #selector(revealExtensions))
+        }
         m.addItem(.separator())
         add(m, "Show / Hide All   \(k.shortcut(.toggleAll))", #selector(toggleAll))
         add(m, "Open Saved Stickies File", #selector(revealStore))
@@ -623,6 +649,40 @@ final class HoverView: NSView {
             open(StickyConfig(kind: .note, note: inFolder ? u.lastPathComponent : u.path))
         }
     }
+
+    @objc func openExtension(_ sender: NSMenuItem) {
+        guard #available(macOS 15.4, *), let ctx = sender.representedObject as? WKWebExtensionContext else { return }
+        // Wait for the menu to close, then show the popup under the menu bar icon.
+        DispatchQueue.main.async { ExtensionHost.shared.openPopup(ctx) }
+    }
+
+    @objc func addExtension() {
+        guard #available(macOS 15.4, *) else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let p = NSOpenPanel()
+        p.canChooseDirectories = true
+        p.canChooseFiles = true
+        p.allowedContentTypes = [.folder, .zip, UTType(filenameExtension: "crx") ?? .data]
+        p.message = "Pick an unpacked extension folder, a .zip, or a .crx"
+        p.prompt = "Add Extension"
+        p.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+        guard p.runModal() == .OK, let url = p.url else { return }
+        Task { @MainActor in
+            let problem = await ExtensionHost.shared.install(from: url)
+            buildStatusMenu()
+            let alert = NSAlert()
+            if let problem {
+                alert.messageText = "Couldn't add the extension"
+                alert.informativeText = problem
+            } else {
+                alert.messageText = "Extension added"
+                alert.informativeText = "Reload open web stickies (⌘R) to use it."
+            }
+            alert.runModal()
+        }
+    }
+
+    @objc func revealExtensions() { NSWorkspace.shared.open(ExtensionsFolder.url) }
 
     @objc func revealNotes() { NSWorkspace.shared.open(NotesFolder.url) }
 
