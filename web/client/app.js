@@ -114,23 +114,19 @@ async function pushChanges() {
   }
 
   for (const n of Object.values(notes)) {
-    if (!n.dirty) continue;
+    if (!n.dirty || n.conflict) continue;  // a conflict waits for the person to choose
     if (!n.updatedAt && !n.body.trim()) continue;  // empty new note: nothing to save yet
     const sent = n.body;
     const { status, data } = await api(`/api/notes/${encodeURIComponent(n.id)}`, {
       method: "PUT",
-      body: JSON.stringify({ body: sent, base: n.updatedAt || null, client: clientId }),
+      body: JSON.stringify({ body: sent, base: n.updatedAt || null, client: clientId, onConflict: "ask" }),
     });
     if (status === 200) {
       n.updatedAt = data.note.updatedAt;
       if (n.body === sent) n.dirty = false;
     } else if (status === 409) {
-      n.body = data.note.body;
-      n.updatedAt = data.note.updatedAt;
-      n.dirty = false;
-      if (data.copy) notes[data.copy.id] = { id: data.copy.id, body: data.copy.body, updatedAt: data.copy.updatedAt };
-      if (currentId === n.id) replaceDoc(n.body);
-      toast("This note changed on another device. Your version was saved as a separate copy.");
+      // Changed on another device too: keep both versions locally and ask what to do.
+      n.conflict = { body: data.note.body, updatedAt: data.note.updatedAt };
     } else {
       throw new Error(data.error || status);
     }
@@ -144,7 +140,12 @@ async function pull() {
   for (const s of data.notes) {
     lastPull = Math.max(lastPull, s.updatedAt);
     const n = notes[s.id];
-    if (n && n.dirty) continue;  // our pending edit wins the race; the server sorts out conflicts
+    if (n && n.conflict) {
+      if (s.deleted) delete n.conflict;  // deleted elsewhere: our edit just brings it back
+      else n.conflict = { body: s.body, updatedAt: s.updatedAt };
+      continue;
+    }
+    if (n && n.dirty) continue;  // our pending edit goes first; the server reports any conflict
     if (s.deleted) {
       if (n) {
         delete notes[s.id];
@@ -175,7 +176,80 @@ async function sync() {
     refreshStatus();
     renderList();
     if (syncAgain) { syncAgain = false; sync(); }
+    askAboutConflicts();
   }
+}
+
+// ---------- Conflicts: ask, don't guess ----------
+
+function preview(body) {
+  const lines = (body || "").split("\n").filter((l) => l.trim()).slice(0, 4).join("\n");
+  return lines.length > 220 ? lines.slice(0, 220) + "…" : lines || "(empty)";
+}
+
+let asking = false;
+
+function askAboutConflicts() {
+  if (asking || document.hidden) return;
+  const n = Object.values(notes).find((x) => x.conflict);
+  if (!n) return;
+  asking = true;
+  const dlg = $("#conflict");
+  $("#conflict-title").textContent = `“${title(n.body)}” changed on another device`;
+  $("#conflict-theirs").textContent = preview(n.conflict.body);
+  $("#conflict-mine").textContent = preview(n.body);
+  dlg.returnValue = "";
+  dlg.onclose = async () => {
+    asking = false;
+    const choice = dlg.returnValue;
+    if (choice) await resolveConflict(n.id, choice);
+    setTimeout(askAboutConflicts, 300);
+  };
+  dlg.showModal();
+}
+
+async function resolveConflict(id, choice) {
+  const n = notes[id];
+  if (!n || !n.conflict) return;
+  try {
+    if (choice === "theirs") {
+      n.body = n.conflict.body;
+      n.updatedAt = n.conflict.updatedAt;
+      n.dirty = false;
+      delete n.conflict;
+      if (currentId === id) replaceDoc(n.body);
+    } else {
+      const keepBoth = choice === "both";
+      const { status, data } = await api(`/api/notes/${encodeURIComponent(id)}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          body: n.body,
+          base: n.updatedAt || null,
+          client: clientId,
+          ...(keepBoth ? { onConflict: "copy" } : { force: true }),
+        }),
+      });
+      if (status === 200) {
+        n.updatedAt = data.note.updatedAt;
+      } else if (status === 409 && data.copy) {
+        // Keep both: the other device's version stays here, ours becomes a copy.
+        notes[data.copy.id] = { id: data.copy.id, body: data.copy.body, updatedAt: data.copy.updatedAt };
+        n.body = data.note.body;
+        n.updatedAt = data.note.updatedAt;
+        if (currentId === id) replaceDoc(n.body);
+        toast("Kept both. Your version is saved as a copy.");
+      } else {
+        throw new Error(data.error || status);
+      }
+      n.dirty = false;
+      delete n.conflict;
+    }
+    persist();
+    renderList();
+  } catch (e) {
+    toast("Couldn't save your choice. It'll ask again.");
+  }
+  refreshStatus();
 }
 
 // ---------- Live updates ----------

@@ -48,7 +48,7 @@ Simple extensions that restyle or tweak pages work well (for example [Better Can
 
 ## Phone app (sync)
 
-`web/` is a small Cloudflare Worker that stores your notes in a D1 database and serves a phone web app with the same live Markdown editing, checklists and search. Changes show up on the other device in about a second: Sticky watches `~/Documents/Sticky Notes`, and both apps keep a live WebSocket to a Durable Object that pings the other devices after every save (with a 30–60 second poll as a fallback). Each device has its own ID, so a save whose reply got lost (say, you reloaded mid-save) never counts as a conflict. If two devices really do edit the same note at once, the other version is kept as a `-conflict-` copy, so nothing is lost. Deleting on either side moves the Mac's file to the Trash.
+`web/` is a small Cloudflare Worker that stores your notes in a D1 database and serves a phone web app with the same live Markdown editing, checklists and search. Changes show up on the other device in about a second: Sticky watches `~/Documents/Sticky Notes`, and both apps keep a live WebSocket to a Durable Object that pings the other devices after every save (with a 30–60 second poll as a fallback). Each device has its own ID, so a save whose reply got lost (say, you reloaded mid-save) never counts as a conflict. If two devices really do edit the same note at once, the device that notices asks you what to do: keep its version, use the other device's, or keep both (yours is saved as a `-conflict-` copy). Nothing is overwritten without asking. Deleting on either side moves the Mac's file to the Trash.
 
 Every API call needs a secret key, so the notes aren't public.
 

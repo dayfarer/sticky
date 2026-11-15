@@ -1,5 +1,5 @@
 // Offline support: network first, cached copy when offline. The /api is never cached.
-const CACHE = "sticky-v2";
+const CACHE = "sticky-v3";
 const SHELL = ["/", "/app.js", "/style.css", "/manifest.webmanifest", "/icon-180.png", "/icon-512.png"];
 
 self.addEventListener("install", (e) => {

@@ -48,6 +48,9 @@ extension Notification.Name {
     private var runAgain = false
     private var timer: Timer?
     private var pending: DispatchWorkItem?
+    /// Notes changed here and on another device, waiting for the person to pick a version.
+    private var conflicts: [String: ServerNote] = [:]
+    private var asking = false
     private(set) var lastSuccess: Date?
     private(set) var lastError: String?
 
@@ -183,6 +186,7 @@ extension Notification.Name {
             saveState()
             NotificationCenter.default.post(name: .stickySyncStatus, object: nil)
             if runAgain { runAgain = false; syncSoon(after: 0.5) }
+            if !conflicts.isEmpty, !asking { DispatchQueue.main.async { SyncEngine.shared.askAboutConflicts() } }
         }
         do {
             try await pull()
@@ -203,6 +207,10 @@ extension Notification.Name {
         for n in list.notes {
             state.lastPull = max(state.lastPull, n.updatedAt)
             guard Self.validID(n.id), !isEditing(n.id) else { continue }
+            if conflicts[n.id] != nil {
+                conflicts[n.id] = n.deleted ? nil : n  // deleted elsewhere: our edit just brings it back
+                continue
+            }
             let url = fileURL(n.id)
             let rec = state.notes[n.id]
             let local = try? Data(contentsOf: url)
@@ -234,7 +242,7 @@ extension Notification.Name {
             } else if localHash == serverHash {
                 state.notes[n.id] = Record(base: n.updatedAt, hash: serverHash)
             }
-            // Both sides changed: push sends ours with the old base, and the server makes a copy.
+            // Both sides changed: push sends ours with the old base, and the server reports a conflict.
         }
     }
 
@@ -245,7 +253,7 @@ extension Notification.Name {
 
         for url in files {
             let id = url.lastPathComponent
-            guard Self.validID(id), !isEditing(id), let data = try? Data(contentsOf: url),
+            guard Self.validID(id), !isEditing(id), conflicts[id] == nil, let data = try? Data(contentsOf: url),
                   let body = String(data: data, encoding: .utf8) else { continue }
             let h = Self.hash(data)
             let rec = state.notes[id]
@@ -256,19 +264,14 @@ extension Notification.Name {
                 "body": body,
                 "base": rec.map { NSNumber(value: $0.base) } ?? NSNull(),
                 "client": state.clientId ?? "",
+                "onConflict": "ask",
             ])
             let (code, resp) = try await request("PUT", "/api/notes/\(Self.encode(id))", body: payload)
             let r = try? JSONDecoder().decode(WriteResponse.self, from: resp)
             if code == 200, let n = r?.note {
                 state.notes[id] = Record(base: n.updatedAt, hash: h)
             } else if code == 409, let n = r?.note {
-                // The other device's version stays; ours now lives on the server as a copy.
-                write(id, n.body)
-                state.notes[id] = Record(base: n.updatedAt, hash: Self.hash(n.body))
-                if let c = r?.copy {
-                    write(c.id, c.body)
-                    state.notes[c.id] = Record(base: c.updatedAt, hash: Self.hash(c.body))
-                }
+                conflicts[id] = n  // ask the person (after this sync finishes)
             } else {
                 throw SyncError.server(code)
             }
@@ -286,6 +289,77 @@ extension Notification.Name {
             } else {
                 throw SyncError.server(code)
             }
+        }
+    }
+
+    // MARK: Conflicts: ask, don't guess
+
+    private static func preview(_ body: String) -> String {
+        let lines = body.split(separator: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.prefix(4)
+        let text = lines.joined(separator: "\n")
+        return text.isEmpty ? "(empty)" : (text.count > 240 ? String(text.prefix(240)) + "…" : text)
+    }
+
+    func askAboutConflicts() {
+        guard !asking, let (id, theirs) = conflicts.first else { return }
+        guard let mine = try? String(contentsOf: fileURL(id), encoding: .utf8) else {
+            conflicts[id] = nil  // file gone; nothing to compare
+            return
+        }
+        asking = true
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "“\(NotesLibrary.title(of: mine))” changed on another device"
+        alert.informativeText = "It was edited somewhere else while you edited it here.\n\nOther device:\n\(Self.preview(theirs.body))\n\nThis Mac:\n\(Self.preview(mine))"
+        alert.addButton(withTitle: "Keep This Mac’s")
+        alert.addButton(withTitle: "Use Other Device’s")
+        alert.addButton(withTitle: "Keep Both")
+        let choice = alert.runModal()
+        Task { @MainActor in
+            await self.resolve(id, choice: choice)
+            self.asking = false
+            if !self.conflicts.isEmpty { self.askAboutConflicts() } else { self.syncSoon(after: 0.2) }
+        }
+    }
+
+    private func resolve(_ id: String, choice: NSApplication.ModalResponse) async {
+        guard let theirs = conflicts[id] else { return }
+        // Re-read: the person may have kept typing while the question was up.
+        guard let mine = try? String(contentsOf: fileURL(id), encoding: .utf8) else { conflicts[id] = nil; return }
+        do {
+            switch choice {
+            case .alertSecondButtonReturn:  // use the other device's version
+                write(id, theirs.body)
+                state.notes[id] = Record(base: theirs.updatedAt, hash: Self.hash(theirs.body))
+            default:
+                let keepBoth = choice == .alertThirdButtonReturn
+                var payload: [String: Any] = ["body": mine, "base": NSNumber(value: theirs.updatedAt), "client": state.clientId ?? ""]
+                if keepBoth {
+                    payload["base"] = state.notes[id].map { NSNumber(value: $0.base) } ?? NSNull()
+                    payload["onConflict"] = "copy"
+                } else {
+                    payload["force"] = true
+                }
+                let (code, resp) = try await request("PUT", "/api/notes/\(Self.encode(id))",
+                                                     body: try JSONSerialization.data(withJSONObject: payload))
+                let r = try? JSONDecoder().decode(WriteResponse.self, from: resp)
+                if code == 200, let n = r?.note {
+                    state.notes[id] = Record(base: n.updatedAt, hash: Self.hash(mine))
+                } else if code == 409, let n = r?.note, let c = r?.copy {
+                    // Keep both: the other device's version takes this name, ours becomes the copy.
+                    write(id, n.body)
+                    state.notes[id] = Record(base: n.updatedAt, hash: Self.hash(n.body))
+                    write(c.id, c.body)
+                    state.notes[c.id] = Record(base: c.updatedAt, hash: Self.hash(c.body))
+                } else {
+                    throw SyncError.server(code)
+                }
+            }
+            conflicts[id] = nil
+            saveState()
+        } catch {
+            lastError = "couldn't save your choice; will ask again"
+            conflicts[id] = nil  // the next sync hits the conflict again and asks
         }
     }
 

@@ -75,7 +75,8 @@ function conflictCopyId(id) {
   const d = new Date();
   const p = (n) => String(n).padStart(2, "0");
   const stamp = `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}-${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`;
-  return `${stem}-conflict-${stamp}.md`;
+  const rand = Array.from(crypto.getRandomValues(new Uint8Array(2)), (x) => x.toString(16).padStart(2, "0")).join("");
+  return `${stem}-conflict-${stamp}-${rand}.md`;  // random part: two copies in one second never collide
 }
 
 // Did another device change this note after the sender last saw it?
@@ -141,12 +142,18 @@ async function handleApi(request, env, ctx, url) {
     const base = typeof input.base === "number" ? input.base : null;
     const client = cleanClient(input.client);
 
+    // On a conflict: "ask" (new clients) returns 409 so the device can ask the person;
+    // "copy" (the default, for older clients) saves this version as a separate copy.
+    // `force: true` means the person chose "keep mine".
+    const onConflict = input.onConflict === "ask" ? "ask" : "copy";
+    const force = input.force === true;
+
     const existing = await getNote(env, id);
     if (existing && !existing.deleted && existing.body === body) return json({ note: publicNote(existing) });
 
-    // Another device changed this note since this device last saw it: keep theirs,
-    // save this version as a separate copy so nothing is lost.
-    if (changedElsewhere(existing, base, client)) {
+    // Another device changed this note since this device last saw it.
+    if (!force && changedElsewhere(existing, base, client)) {
+      if (onConflict === "ask") return json({ conflict: true, note: publicNote(existing) }, 409);
       const copy = await writeNote(env, conflictCopyId(id), body, client);
       notify(env, ctx, copy.updatedAt, client);
       return json({ conflict: true, note: publicNote(existing), copy: publicNote(copy) }, 409);

@@ -81,6 +81,24 @@
     </nav>
   </section>
 
+  <dialog id="conflict">
+    <form method="dialog">
+      <h2 id="conflict-title">This note changed on another device</h2>
+      <p class="conflict-hint">It was edited somewhere else while you were editing it here. Which version do you want?</p>
+      <div class="version">
+        <span class="version-label">Other device</span>
+        <pre id="conflict-theirs"></pre>
+      </div>
+      <div class="version">
+        <span class="version-label">This phone</span>
+        <pre id="conflict-mine"></pre>
+      </div>
+      <button value="mine" class="primary">Keep this phone's</button>
+      <button value="theirs" class="secondary">Use the other device's</button>
+      <button value="both" class="secondary">Keep both</button>
+    </form>
+  </dialog>
+
   <div id="toast" role="status" aria-live="polite"></div>
   <script type="module" src="/app.js"></script>
 </body>

@@ -151,3 +151,26 @@ section { min-height: 100%; }
 }
 #toast.show { opacity: 1; transform: translate(-50%, 0); }
 body[data-screen="editor"] #toast { bottom: calc(env(safe-area-inset-bottom) + 120px); }
+
+/* Conflict prompt */
+#conflict {
+  width: min(420px, calc(100% - 32px)); max-height: calc(100dvh - 48px); overflow: auto;
+  border: 0; border-radius: 18px; padding: 20px;
+  background: var(--surface); color: var(--text);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+}
+#conflict::backdrop { background: rgba(0, 0, 0, 0.45); }
+#conflict h2 { font-size: 19px; line-height: 1.3; margin: 0 0 6px; }
+.conflict-hint { color: var(--muted); font-size: 14px; margin: 0 0 14px; }
+.version { margin-bottom: 10px; }
+.version-label { display: block; font-size: 12px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-bottom: 4px; }
+.version pre {
+  margin: 0; padding: 10px 12px; border-radius: 10px; background: var(--code-bg);
+  font: 14px/1.45 -apple-system, system-ui, sans-serif; white-space: pre-wrap; word-break: break-word;
+  max-height: 120px; overflow: auto;
+}
+.secondary {
+  width: 100%; height: 46px; margin-top: 8px; border-radius: 12px;
+  background: var(--code-bg); color: var(--text); font-weight: 600; font-size: 16px;
+}
+#conflict .primary { margin-top: 14px; }
