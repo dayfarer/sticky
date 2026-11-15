@@ -8,7 +8,7 @@ Floating, always-on-top windows for macOS. Each sticky runs a terminal command o
 - **Claude CLI sticky** — runs `claude` in a folder you pick.
 - **Terminal sticky** — runs any command (`python3`, `htop`, `npm run dev`, …). When it exits you get a normal shell.
 - **Web sticky** — any website. Sign-ins are saved.
-- **Notes** — works like Raycast Notes. **⌃⌘B** shows or hides the notes window, which shows one note at a time. Markdown formats as you type: headings, **bold**, *italic*, underline, ~~strike~~, `code`, code blocks, quotes, links, and clickable `- [ ]` checklists. Enter continues lists, Tab indents them. Notes autosave as plain `.md` files in `~/Documents/Sticky Notes`.
+- **Notes** — works like Raycast Notes. **⌃⌘B** shows or hides the notes window, which shows one note at a time. Markdown formats as you type: headings, **bold**, *italic*, underline, ~~strike~~, `code`, code blocks, quotes, links, and clickable `- [ ]` checklists. Return starts a new paragraph (or list item), Shift+Return adds a line break in the same paragraph, Tab indents lists. Notes autosave as plain `.md` files in `~/Documents/Sticky Notes`.
 - Fades to 40% when the mouse leaves and the window isn't focused.
 - **⌃⌥Space** shows or hides all stickies (no Accessibility permission needed).
 - Remembers each sticky's position and reopens them on launch.

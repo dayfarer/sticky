@@ -24,6 +24,27 @@ struct NoteInfo {
     let modified: Date
 }
 
+/// Shift+Return makes a line break inside a paragraph. In the editor that's U+2028;
+/// in the .md file it's a standard Markdown hard break (two spaces before the newline).
+enum LineBreaks {
+    static let separator = "\u{2028}"
+    private static let hardBreak = try! NSRegularExpression(pattern: " {2,}\n")
+
+    static func toEditor(_ file: String) -> String {
+        let ns = file as NSString
+        return hardBreak.stringByReplacingMatches(in: file, range: NSRange(location: 0, length: ns.length),
+                                                  withTemplate: separator)
+    }
+
+    static func toFile(_ editor: String) -> String {
+        editor.replacingOccurrences(of: separator, with: "  \n")
+    }
+
+    static func toPlain(_ editor: String) -> String {
+        editor.replacingOccurrences(of: separator, with: "\n")
+    }
+}
+
 enum NotesLibrary {
     static func url(for id: String) -> URL {
         id.hasPrefix("/") ? URL(fileURLWithPath: id) : NotesFolder.url.appendingPathComponent(id)
@@ -135,7 +156,7 @@ enum Markdown {
         let full = NSRange(location: 0, length: (str as NSString).length)
         let para = NSMutableParagraphStyle()
         para.lineSpacing = 3 * scale
-        para.paragraphSpacing = 4 * scale
+        para.paragraphSpacing = 9 * scale
         let base = self.base, mono = self.mono
         ts.setAttributes([.font: base, .foregroundColor: NSColor.labelColor, .paragraphStyle: para], range: full)
 
@@ -238,6 +259,20 @@ final class MarkdownTextView: NSTextView {
     private static let prefix = try! NSRegularExpression(
         pattern: #"^([ \t]*)([-*+] \[[ xX]\] ?|[-*+] |\d+[.)] |> ?)?(.*)$"#)
     private static let headingPrefix = try! NSRegularExpression(pattern: #"^(#{1,6})[ \t]+"#)
+
+    /// Copy with normal newlines, so pasting elsewhere looks right.
+    override func copy(_ sender: Any?) {
+        let r = selectedRange()
+        guard r.length > 0 else { return super.copy(sender) }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(LineBreaks.toPlain((string as NSString).substring(with: r)), forType: .string)
+    }
+
+    override func cut(_ sender: Any?) {
+        guard selectedRange().length > 0 else { return }
+        copy(sender)
+        replace(selectedRange(), with: "")
+    }
 
     override func mouseDown(with event: NSEvent) {
         let idx = characterIndexForInsertion(at: convert(event.locationInWindow, from: nil))
@@ -509,7 +544,8 @@ final class MarkdownTextView: NSTextView {
     }
 
     var title: String { NotesLibrary.title(of: textView.string) }
-    var text: String { textView.string }
+    /// Note text as saved in the file.
+    var text: String { LineBreaks.toFile(textView.string) }
 
     /// Shows another note in this editor (saves the current one first).
     func load(_ id: String, initialText: String? = nil) {
@@ -517,7 +553,7 @@ final class MarkdownTextView: NSTextView {
         noteID = id
         fileURL = NotesLibrary.url(for: id)
         loading = true
-        textView.string = initialText ?? (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
+        textView.string = LineBreaks.toEditor(initialText ?? (try? String(contentsOf: fileURL, encoding: .utf8)) ?? "")
         loading = false
         dirty = initialText != nil
         restyle()
@@ -539,7 +575,7 @@ final class MarkdownTextView: NSTextView {
         pendingSave?.cancel()
         guard dirty else { return }
         dirty = false
-        try? textView.string.write(to: fileURL, atomically: true, encoding: .utf8)
+        try? LineBreaks.toFile(textView.string).write(to: fileURL, atomically: true, encoding: .utf8)
     }
 
     /// Forget unsaved changes (used before deleting a note).
@@ -574,7 +610,12 @@ final class MarkdownTextView: NSTextView {
 
     func textView(_ tv: NSTextView, doCommandBy sel: Selector) -> Bool {
         switch sel {
-        case #selector(NSResponder.insertNewline(_:)): return continueList(tv)
+        case #selector(NSResponder.insertNewline(_:)):
+            if NSApp.currentEvent?.modifierFlags.contains(.shift) == true {
+                tv.insertText(LineBreaks.separator, replacementRange: tv.selectedRange())
+                return true
+            }
+            return continueList(tv)
         case #selector(NSResponder.insertTab(_:)): return indent(tv, inward: true)
         case #selector(NSResponder.insertBacktab(_:)): return indent(tv, inward: false)
         default: return false
