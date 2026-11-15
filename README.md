@@ -46,6 +46,26 @@ WebKit doesn't send extensions the `runtime.onInstalled` event in apps like Stic
 
 Simple extensions that restyle or tweak pages work well (for example [Better Canvas](https://github.com/UseBetterCanvas/bettercanvas)). Extensions that talk to a desktop app, like password managers, won't.
 
+## Phone app (sync)
+
+`web/` is a small Cloudflare Worker that stores your notes in a D1 database and serves a phone web app with the same live Markdown editing, checklists and search. Sticky on the Mac syncs `~/Documents/Sticky Notes` with it every 30 seconds and right after you save. If a note is edited in two places at once, the other version is kept as a `-conflict-` copy, so nothing is lost. Deleting on either side moves the Mac's file to the Trash.
+
+Every API call needs a secret key, so the notes aren't public.
+
+**Set up your own:**
+
+```bash
+cd web && npm install
+npx wrangler d1 create sticky-notes        # copy the database_id into wrangler.toml
+npx wrangler d1 execute sticky-notes --remote --file=schema.sql
+openssl rand -base64 32 | tr -d '/+=\n' | npx wrangler secret put SYNC_KEY
+npm run deploy                             # prints your https://….workers.dev URL
+```
+
+Then create `~/.config/sticky/sync.json` (chmod 600) with `{"url": "https://…workers.dev", "key": "<the same key>"}` and relaunch Sticky. The menu gets **Sync Notes Now**, **Copy Phone Sync Key** and **Open Notes on the Web**.
+
+On the iPhone: open the URL in Safari → Share → **Add to Home Screen**, open it from the Home Screen, and paste the key (copy it on the Mac with **Copy Phone Sync Key**; Universal Clipboard carries it over).
+
 ## Requirements
 
 - macOS 14 or later

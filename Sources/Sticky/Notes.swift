@@ -504,6 +504,11 @@ final class MarkdownTextView: NSTextView {
     private static let listPrefix = try! NSRegularExpression(
         pattern: #"^([ \t]*)([-*+] \[[ xX]\] |[-*+] |(\d+)([.)]) |> )"#)
 
+    /// Every open editor, so sync can tell which notes are mid-edit.
+    private static let registry = NSHashTable<NoteEditor>.weakObjects()
+    static var open: [NoteEditor] { registry.allObjects }
+    var hasUnsavedChanges: Bool { dirty }
+
     init(noteID: String, frame: NSRect) {
         self.noteID = noteID
         fileURL = NotesLibrary.url(for: noteID)
@@ -540,6 +545,13 @@ final class MarkdownTextView: NSTextView {
         NotificationCenter.default.addObserver(forName: .stickyRestyleNotes, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.restyle() }
         }
+        NotificationCenter.default.addObserver(forName: .stickyNoteFileChanged, object: nil, queue: .main) { [weak self] n in
+            MainActor.assumeIsolated {
+                guard let self, let id = n.object as? String, id == self.noteID else { return }
+                self.reloadFromDisk()
+            }
+        }
+        Self.registry.add(self)
         load(noteID)
     }
 
@@ -565,6 +577,21 @@ final class MarkdownTextView: NSTextView {
         onTitle?(title)
     }
 
+    /// Sync changed this note's file: show the new text if there's no unsaved typing.
+    func reloadFromDisk() {
+        guard !dirty, let raw = try? String(contentsOf: fileURL, encoding: .utf8) else { return }
+        let text = LineBreaks.toEditor(raw)
+        guard text != textView.string else { return }
+        let sel = textView.selectedRange()
+        loading = true
+        textView.string = text
+        loading = false
+        restyle()
+        let len = (text as NSString).length
+        textView.setSelectedRange(NSRange(location: min(sel.location, len), length: 0))
+        onTitle?(title)
+    }
+
     func restyle() {
         if let ts = textView.textStorage { Markdown.style(ts) }
         textView.typingAttributes[.font] = Markdown.base
@@ -576,6 +603,7 @@ final class MarkdownTextView: NSTextView {
         guard dirty else { return }
         dirty = false
         try? LineBreaks.toFile(textView.string).write(to: fileURL, atomically: true, encoding: .utf8)
+        NotificationCenter.default.post(name: .stickyNoteSaved, object: noteID)
     }
 
     /// Forget unsaved changes (used before deleting a note).

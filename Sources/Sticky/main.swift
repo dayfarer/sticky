@@ -167,6 +167,14 @@ final class HoverView: NSView {
         historyIndex = 0
         updateNoteTitle(editor.title)
         panel.keyHandler = { [weak self] e in self?.handleNoteKey(e) ?? false }
+        NotificationCenter.default.addObserver(forName: .stickyNoteFileChanged, object: nil, queue: .main) { [weak self] n in
+            MainActor.assumeIsolated {
+                guard let self, let note = self.note, let id = n.object as? String, id == note.noteID,
+                      !FileManager.default.fileExists(atPath: note.fileURL.path), !note.hasUnsavedChanges else { return }
+                note.discard()
+                self.switchTo(NotesLibrary.all().first?.id ?? NotesLibrary.newID(), record: false)
+            }
+        }
     }
 
     // MARK: Note commands
@@ -460,6 +468,10 @@ final class HoverView: NSView {
         buildStatusMenu()
         installHotKeyHandler()
         registerGlobalHotKeys()
+        SyncEngine.shared.start()
+        NotificationCenter.default.addObserver(forName: .stickySyncStatus, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.syncStatusItem?.title = SyncEngine.shared.statusText }
+        }
         Keymap.shared.onChange = { [weak self] in
             self?.registerGlobalHotKeys()
             self?.buildStatusMenu()
@@ -496,6 +508,16 @@ final class HoverView: NSView {
         add(m, "Open Note File…", #selector(openNote))
         add(m, "Open Notes Folder", #selector(revealNotes))
         add(m, "Edit Keybindings…", #selector(editKeybindings))
+        if SyncEngine.shared.isConfigured {
+            m.addItem(.separator())
+            let status = NSMenuItem(title: SyncEngine.shared.statusText, action: nil, keyEquivalent: "")
+            status.isEnabled = false
+            m.addItem(status)
+            syncStatusItem = status
+            add(m, "Sync Notes Now", #selector(syncNow))
+            add(m, "Copy Phone Sync Key", #selector(copyPhoneKey))
+            add(m, "Open Notes on the Web", #selector(openWebNotes))
+        }
         m.addItem(.separator())
         add(m, "New Claude Code Sticky (web)", #selector(newClaudeCodeWeb))
         add(m, "New Claude CLI Sticky…", #selector(newClaude))
@@ -673,6 +695,23 @@ final class HoverView: NSView {
             let inFolder = u.deletingLastPathComponent().standardizedFileURL == NotesFolder.url.standardizedFileURL
             open(StickyConfig(kind: .note, note: inFolder ? u.lastPathComponent : u.path))
         }
+    }
+
+    private weak var syncStatusItem: NSMenuItem?
+
+    @objc func syncNow() { SyncEngine.shared.syncSoon(after: 0) }
+
+    @objc func copyPhoneKey() {
+        SyncEngine.shared.copyKeyForPhone()
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "Sync key copied"
+        a.informativeText = "On your iPhone, open Sticky Notes and paste it (Universal Clipboard). The key is cleared from the clipboard in 2 minutes."
+        a.runModal()
+    }
+
+    @objc func openWebNotes() {
+        if let s = SyncEngine.shared.config?.url, let u = URL(string: s) { NSWorkspace.shared.open(u) }
     }
 
     @objc func openExtension(_ sender: NSMenuItem) {

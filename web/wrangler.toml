@@ -1,0 +1,13 @@
+name = "sticky-notes"
+main = "src/worker.js"
+compatibility_date = "2025-09-01"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "sticky-notes"
+database_id = "a34e46df-32ba-4f79-ad58-bb7abdb838bb"

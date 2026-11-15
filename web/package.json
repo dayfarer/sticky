@@ -1,0 +1,21 @@
+{
+  "name": "sticky-notes-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild client/app.js --bundle --minify --format=esm --target=es2020,safari15 --outfile=public/app.js",
+    "dev": "npm run build && npx wrangler dev",
+    "deploy": "npm run build && npx wrangler deploy"
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.8.0",
+    "@codemirror/lang-markdown": "^6.3.2",
+    "@codemirror/language": "^6.11.0",
+    "@codemirror/state": "^6.5.2",
+    "@codemirror/view": "^6.36.5",
+    "@lezer/highlight": "^1.2.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.2"
+  }
+}
