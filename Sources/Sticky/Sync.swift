@@ -19,7 +19,11 @@ extension Notification.Name {
 
     struct Config: Codable { var url: String; var key: String }
     private struct Record: Codable { var base: Int64; var hash: String }
-    private struct State: Codable { var lastPull: Int64 = 0; var notes: [String: Record] = [:] }
+    private struct State: Codable {
+        var lastPull: Int64 = 0
+        var notes: [String: Record] = [:]
+        var clientId: String?  // this Mac's ID, so the server knows our saves from other devices'
+    }
     private struct ServerNote: Codable { let id: String; let body: String; let updatedAt: Int64; let deleted: Bool }
     private struct ListResponse: Codable { let notes: [ServerNote] }
     private struct WriteResponse: Codable { let note: ServerNote?; let copy: ServerNote? }
@@ -60,17 +64,96 @@ extension Notification.Name {
             state = s
         }
         guard config != nil else { return }
+        if state.clientId == nil {
+            state.clientId = "mac-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(16).lowercased()
+            saveState()
+        }
 
+        // Fallback poll, plus a keepalive for the live connection.
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in
-            MainActor.assumeIsolated { SyncEngine.shared.syncSoon(after: 0) }
+            MainActor.assumeIsolated {
+                let me = SyncEngine.shared
+                me.syncSoon(after: 0)
+                if let s = me.socket { s.send(.string("ping")) { _ in } } else { me.connectLive() }
+            }
         }
         NotificationCenter.default.addObserver(forName: .stickyNoteSaved, object: nil, queue: .main) { _ in
-            MainActor.assumeIsolated { SyncEngine.shared.syncSoon(after: 1.5) }
+            MainActor.assumeIsolated { SyncEngine.shared.syncSoon(after: 0.2) }
         }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
-            MainActor.assumeIsolated { SyncEngine.shared.syncSoon(after: 3) }
+            MainActor.assumeIsolated {
+                SyncEngine.shared.disconnectLive()
+                SyncEngine.shared.connectLive()
+                SyncEngine.shared.syncSoon(after: 3)
+            }
         }
+        connectLive()
+        watchFolder()
         syncSoon(after: 1)
+    }
+
+    // MARK: Folder watching
+    // Any change in the notes folder (Sticky's own saves, or another app editing a file) syncs at once.
+
+    private var stream: FSEventStreamRef?
+
+    private func watchFolder() {
+        var context = FSEventStreamContext(version: 0, info: nil, retain: nil, release: nil, copyDescription: nil)
+        let callback: FSEventStreamCallback = { _, _, _, _, _, _ in
+            MainActor.assumeIsolated { SyncEngine.shared.syncSoon(after: 0.3) }
+        }
+        let flags = FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer)
+        guard let s = FSEventStreamCreate(nil, callback, &context, [NotesFolder.url.path] as CFArray,
+                                          FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.2, flags) else { return }
+        FSEventStreamSetDispatchQueue(s, .main)
+        FSEventStreamStart(s)
+        stream = s
+    }
+
+    // MARK: Live updates
+    // A WebSocket to the server; it pings us right after another device saves.
+
+    private var socket: URLSessionWebSocketTask?
+    private var socketRetry: TimeInterval = 1
+
+    func connectLive() {
+        guard socket == nil, let c = config, var parts = URLComponents(string: c.url + "/api/live") else { return }
+        parts.scheme = parts.scheme == "http" ? "ws" : "wss"
+        parts.queryItems = [URLQueryItem(name: "client", value: state.clientId)]
+        guard let url = parts.url else { return }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(c.key)", forHTTPHeaderField: "Authorization")
+        let task = URLSession.shared.webSocketTask(with: req)
+        socket = task
+        task.resume()
+        listen(task)
+    }
+
+    func disconnectLive() {
+        socket?.cancel(with: .goingAway, reason: nil)
+        socket = nil
+    }
+
+    private func listen(_ task: URLSessionWebSocketTask) {
+        task.receive { result in
+            Task { @MainActor in
+                let me = SyncEngine.shared
+                guard task === me.socket else { return }
+                switch result {
+                case .success(let message):
+                    me.socketRetry = 1
+                    if case .string(let text) = message, text.contains("changed") { me.syncSoon(after: 0) }
+                    me.listen(task)
+                case .failure:
+                    me.socket = nil
+                    let wait = me.socketRetry
+                    me.socketRetry = min(me.socketRetry * 2, 60)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + wait) {
+                        MainActor.assumeIsolated { SyncEngine.shared.connectLive() }
+                    }
+                }
+            }
+        }
     }
 
     func syncSoon(after delay: TimeInterval) {
@@ -172,6 +255,7 @@ extension Notification.Name {
             let payload = try JSONSerialization.data(withJSONObject: [
                 "body": body,
                 "base": rec.map { NSNumber(value: $0.base) } ?? NSNull(),
+                "client": state.clientId ?? "",
             ])
             let (code, resp) = try await request("PUT", "/api/notes/\(Self.encode(id))", body: payload)
             let r = try? JSONDecoder().decode(WriteResponse.self, from: resp)
@@ -192,7 +276,7 @@ extension Notification.Name {
 
         // Notes deleted on this Mac.
         for (id, rec) in state.notes where !fm.fileExists(atPath: fileURL(id).path) {
-            let (code, resp) = try await request("DELETE", "/api/notes/\(Self.encode(id))?base=\(rec.base)")
+            let (code, resp) = try await request("DELETE", "/api/notes/\(Self.encode(id))?base=\(rec.base)&client=\(state.clientId ?? "")")
             if code == 200 {
                 state.notes[id] = nil
             } else if code == 409, let n = (try? JSONDecoder().decode(WriteResponse.self, from: resp))?.note {

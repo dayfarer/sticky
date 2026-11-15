@@ -20,6 +20,13 @@ let deletes = store.get("sticky.deletes", []);    // [{ id, base }] waiting to r
 let lastPull = store.get("sticky.lastPull", 0);
 let lastSynced = store.get("sticky.lastSynced", 0);
 
+// A random ID for this device, so the server knows our own saves from other devices' edits.
+let clientId = store.get("sticky.client", "");
+if (!clientId) {
+  clientId = "web-" + Array.from(crypto.getRandomValues(new Uint8Array(8)), (x) => x.toString(16).padStart(2, "0")).join("");
+  store.set("sticky.client", clientId);
+}
+
 function persist() {
   store.set("sticky.notes", notes);
   store.set("sticky.deletes", deletes);
@@ -91,11 +98,12 @@ async function api(path, opts = {}) {
 // ---------- Sync ----------
 
 let syncing = false;
+let syncAgain = false;
 let pushTimer;
 
 async function pushChanges() {
   for (const d of [...deletes]) {
-    const q = d.base ? `?base=${d.base}` : "";
+    const q = `?client=${clientId}` + (d.base ? `&base=${d.base}` : "");
     const { status, data } = await api(`/api/notes/${encodeURIComponent(d.id)}${q}`, { method: "DELETE" });
     if (status === 409 && data.note) {
       notes[d.id] = { id: d.id, body: data.note.body, updatedAt: data.note.updatedAt };
@@ -111,7 +119,7 @@ async function pushChanges() {
     const sent = n.body;
     const { status, data } = await api(`/api/notes/${encodeURIComponent(n.id)}`, {
       method: "PUT",
-      body: JSON.stringify({ body: sent, base: n.updatedAt || null }),
+      body: JSON.stringify({ body: sent, base: n.updatedAt || null, client: clientId }),
     });
     if (status === 200) {
       n.updatedAt = data.note.updatedAt;
@@ -152,7 +160,8 @@ async function pull() {
 }
 
 async function sync() {
-  if (syncing || !key) return;
+  if (!key) return;
+  if (syncing) { syncAgain = true; return; }
   syncing = true;
   try {
     await pushChanges();
@@ -165,12 +174,43 @@ async function sync() {
     syncing = false;
     refreshStatus();
     renderList();
+    if (syncAgain) { syncAgain = false; sync(); }
   }
 }
 
+// ---------- Live updates ----------
+// The server pings every other device right after a save, so changes show up in about a second.
+
+let socket = null;
+let socketRetry = 1000;
+let socketTimer;
+
+function connectLive() {
+  if (!key || document.hidden || (socket && socket.readyState <= 1)) return;
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${proto}//${location.host}/api/live?client=${clientId}`, ["sticky", "key." + key]);
+  socket = ws;
+  ws.onopen = () => { socketRetry = 1000; sync(); };
+  ws.onmessage = (e) => { if (String(e.data).includes("changed")) sync(); };
+  ws.onclose = () => {
+    if (socket === ws) socket = null;
+    clearTimeout(socketTimer);
+    if (key && !document.hidden) socketTimer = setTimeout(connectLive, socketRetry);
+    socketRetry = Math.min(socketRetry * 2, 30000);
+  };
+}
+
+function disconnectLive() {
+  clearTimeout(socketTimer);
+  if (socket) { const ws = socket; socket = null; ws.close(); }
+}
+
+// Keep the connection from going idle on mobile networks.
+setInterval(() => { if (socket && socket.readyState === 1) socket.send("ping"); }, 25000);
+
 function schedulePush() {
   clearTimeout(pushTimer);
-  pushTimer = setTimeout(sync, 800);
+  pushTimer = setTimeout(sync, 400);
 }
 
 // ---------- Editor ----------
@@ -495,6 +535,7 @@ async function connect() {
     $("#key-input").value = "";
     show("list");
     await sync();
+    connectLive();
   } catch (e) {
     key = prev;
     $("#setup-msg").textContent = e.status === 401 ? "That key didn't work. Check you copied all of it." : "Couldn't reach the server. Check your connection.";
@@ -516,13 +557,17 @@ $("#signout").addEventListener("click", () => {
   if (!confirm("Remove the sync key from this phone? Your notes stay on the server.")) return;
   key = "";
   store.set("sticky.key", "");
+  disconnectLive();
   showSetup();
 });
 
-document.addEventListener("visibilitychange", () => { if (!document.hidden) sync(); else persist(); });
-window.addEventListener("online", sync);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) { sync(); connectLive(); }
+  else { persist(); disconnectLive(); }
+});
+window.addEventListener("online", () => { sync(); connectLive(); });
 window.addEventListener("offline", refreshStatus);
-setInterval(() => { if (!document.hidden) sync(); }, 20000);
+setInterval(() => { if (!document.hidden) sync(); }, 60000);  // fallback if the live connection drops
 setInterval(refreshStatus, 30000);
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
@@ -532,6 +577,7 @@ if (key) {
   renderList();
   refreshStatus();
   sync();
+  connectLive();
 } else {
   showSetup();
 }
