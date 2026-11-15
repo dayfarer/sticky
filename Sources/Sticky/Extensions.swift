@@ -164,7 +164,31 @@ enum ExtensionsFolder {
         } else if let view = NSApp.keyWindow?.contentView {
             popover.show(relativeTo: view.bounds, of: view, preferredEdge: .maxY)
         }
+        if let web = action.popupWebView { fitPopover(popover, to: web) }
         completionHandler(nil)
+    }
+
+    /// Shrinks the popup to the page's real size, like Chrome does (max 800 × 600).
+    private func fitPopover(_ popover: NSPopover, to web: WKWebView) {
+        let js = """
+        (() => { const b = document.body, d = document.documentElement;
+          const s = getComputedStyle(b);
+          const w = b.getBoundingClientRect().width + parseFloat(s.marginLeft) + parseFloat(s.marginRight);
+          return [Math.ceil(w), Math.ceil(Math.max(b.scrollHeight, d.scrollHeight))]; })()
+        """
+        for delay in [0.15, 0.5, 1.2] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak popover, weak web] in
+                guard let popover, let web, popover.isShown else { return }
+                web.evaluateJavaScript(js) { result, _ in
+                    guard let nums = result as? [NSNumber], nums.count == 2 else { return }
+                    let w = min(max(CGFloat(nums[0].doubleValue), 120), 800)
+                    let h = min(max(CGFloat(nums[1].doubleValue), 60), 600)
+                    if abs(popover.contentSize.width - w) > 1 || abs(popover.contentSize.height - h) > 1 {
+                        popover.contentSize = NSSize(width: w, height: h)
+                    }
+                }
+            }
+        }
     }
 
     func webExtensionController(_ controller: WKWebExtensionController,

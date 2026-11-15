@@ -472,6 +472,11 @@ final class HoverView: NSView {
             if #available(macOS 15.4, *) {
                 await ExtensionHost.shared.loadAll()
                 buildStatusMenu()
+                // Debug: STICKY_DEBUG_POPUP=1 opens the first extension's popup on launch.
+                if ProcessInfo.processInfo.environment["STICKY_DEBUG_POPUP"] != nil,
+                   let ctx = ExtensionHost.shared.contexts.first {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { ExtensionHost.shared.openPopup(ctx) }
+                }
             }
             for c in Store.load() { open(c) }
             if stickies.isEmpty { newClaudeHere(folder: NSHomeDirectory() + "/Documents") }
