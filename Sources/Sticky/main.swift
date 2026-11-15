@@ -3,18 +3,20 @@ import AppKit
 import Carbon
 import ServiceManagement
 import SwiftTerm
+import UniformTypeIdentifiers
 import WebKit
 
 // MARK: - Saved state
 
 struct StickyConfig: Codable {
-    enum Kind: String, Codable { case terminal, web }
+    enum Kind: String, Codable { case terminal, web, note }
     var id = UUID()
     var kind: Kind
     var command: String?
     var folder: String?
     var url: String?
     var frame: CGRect?
+    var note: String?  // note file name in ~/Documents/Sticky Notes, or a full path
 }
 
 enum Store {
@@ -77,6 +79,7 @@ final class HoverView: NSView {
     private var web: WKWebView?
     private var titleObserver: NSKeyValueObservation?
     private var popups: [NSPanel] = []
+    private var note: NoteEditor?
 
     init(config: StickyConfig, app: AppDelegate, cascade: Int) {
         self.config = config
@@ -86,7 +89,11 @@ final class HoverView: NSView {
             contentRect: start,
             styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
             backing: .buffered, defer: false)
-        if let saved = config.frame { panel.setFrame(saved, display: false) }
+        if let saved = config.frame {
+            panel.setFrame(saved, display: false)
+        } else if config.kind == .note {
+            panel.setContentSize(NSSize(width: 380, height: 440))
+        }
 
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -111,6 +118,7 @@ final class HoverView: NSView {
         switch config.kind {
         case .terminal: setUpTerminal(in: container)
         case .web: setUpWeb(in: container)
+        case .note: setUpNote(in: container)
         }
     }
 
@@ -139,6 +147,17 @@ final class HoverView: NSView {
         panel.title = "\(command) — \((folder as NSString).lastPathComponent)"
     }
 
+    private func setUpNote(in container: NSView) {
+        let name = config.note ?? "note-\(config.id.uuidString.prefix(8).lowercased()).md"
+        config.note = name
+        let file = name.hasPrefix("/") ? URL(fileURLWithPath: name) : NotesFolder.url.appendingPathComponent(name)
+        let editor = NoteEditor(fileURL: file, frame: container.bounds)
+        editor.onTitle = { [weak self] t in self?.panel.title = t }
+        container.addSubview(editor.scroll)
+        panel.title = editor.title
+        note = editor
+    }
+
     private func setUpWeb(in container: NSView) {
         let w = WKWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
         w.autoresizingMask = [.width, .height]
@@ -160,6 +179,7 @@ final class HoverView: NSView {
         panel.makeKey()
         if let t = term { panel.makeFirstResponder(t) }
         if let w = web { panel.makeFirstResponder(w) }
+        if let n = note { panel.makeFirstResponder(n.textView) }
         updateAlpha()
     }
 
@@ -224,6 +244,7 @@ final class HoverView: NSView {
     func windowDidEndLiveResize(_ n: Notification) { saveFrame() }
     func windowWillClose(_ n: Notification) {
         if let t = term, t.process.running { t.process.terminate() }
+        note?.saveNow()
         app?.remove(self)
     }
 
@@ -245,6 +266,7 @@ final class HoverView: NSView {
     private var stickies: [StickyController] = []
     private var hidden = false
     private var hotKeyRef: EventHotKeyRef?
+    private var noteHotKeyRef: EventHotKeyRef?
 
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.accessory)  // menu bar only, no Dock icon
@@ -262,6 +284,10 @@ final class HoverView: NSView {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "note.text", accessibilityDescription: "Sticky")
         let m = NSMenu()
+        add(m, "New Note   ⌃⌥N", #selector(newNote))
+        add(m, "Open Note…", #selector(openNote))
+        add(m, "Open Notes Folder", #selector(revealNotes))
+        m.addItem(.separator())
         add(m, "New Claude Code Sticky (web)", #selector(newClaudeCodeWeb))
         add(m, "New Claude CLI Sticky…", #selector(newClaude))
         add(m, "New Terminal Sticky…", #selector(newTerminal))
@@ -311,14 +337,21 @@ final class HoverView: NSView {
     // Global hotkey ⌃⌥Space. Uses Carbon, so no Accessibility permission needed.
     private func registerHotKey() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, userData in
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, userData in
+            var hk = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                              nil, MemoryLayout<EventHotKeyID>.size, nil, &hk)
+            let id = hk.id
             let me = Unmanaged<AppDelegate>.fromOpaque(userData!).takeUnretainedValue()
-            DispatchQueue.main.async { me.toggleAll() }
+            DispatchQueue.main.async { if id == 2 { me.newNote() } else { me.toggleAll() } }
             return noErr
         }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
         RegisterEventHotKey(UInt32(kVK_Space), UInt32(controlKey | optionKey),
                             EventHotKeyID(signature: OSType(0x5354_4B59), id: 1),
                             GetApplicationEventTarget(), 0, &hotKeyRef)
+        RegisterEventHotKey(UInt32(kVK_ANSI_N), UInt32(controlKey | optionKey),
+                            EventHotKeyID(signature: OSType(0x5354_4B59), id: 2),
+                            GetApplicationEventTarget(), 0, &noteHotKeyRef)
     }
 
     // Actions
@@ -337,6 +370,25 @@ final class HoverView: NSView {
               let folder = pickFolder() else { return }
         open(StickyConfig(kind: .terminal, command: cmd, folder: folder))
     }
+
+    @objc func newNote() {
+        open(StickyConfig(kind: .note))
+    }
+
+    @objc func openNote() {
+        NSApp.activate(ignoringOtherApps: true)
+        let p = NSOpenPanel()
+        p.directoryURL = NotesFolder.url
+        p.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText, .plainText]
+        p.allowsMultipleSelection = true
+        guard p.runModal() == .OK else { return }
+        for u in p.urls {
+            let inFolder = u.deletingLastPathComponent().standardizedFileURL == NotesFolder.url.standardizedFileURL
+            open(StickyConfig(kind: .note, note: inFolder ? u.lastPathComponent : u.path))
+        }
+    }
+
+    @objc func revealNotes() { NSWorkspace.shared.open(NotesFolder.url) }
 
     @objc func newClaudeCodeWeb() {
         open(StickyConfig(kind: .web, url: "https://claude.ai/code"))
