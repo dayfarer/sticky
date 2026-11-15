@@ -8,12 +8,35 @@ Floating, always-on-top windows for macOS. Each sticky runs a terminal command o
 - **Claude CLI sticky** — runs `claude` in a folder you pick.
 - **Terminal sticky** — runs any command (`python3`, `htop`, `npm run dev`, …). When it exits you get a normal shell.
 - **Web sticky** — any website. Sign-ins are saved.
-- **Note sticky** — a Markdown note that formats as you type: headings, **bold**, *italic*, ~~strike~~, `code`, code blocks, quotes, links, and clickable `- [ ]` checklists. Enter continues lists, Tab indents them. Shortcuts: ⌘B, ⌘I, ⌘E (code), ⌘⇧X (strike), ⌘L (checklist). **⌃⌥N** makes a new note from anywhere. Notes autosave as plain `.md` files in `~/Documents/Sticky Notes`.
+- **Notes** — works like Raycast Notes. **⌃⌘B** shows or hides the notes window, which shows one note at a time. Markdown formats as you type: headings, **bold**, *italic*, underline, ~~strike~~, `code`, code blocks, quotes, links, and clickable `- [ ]` checklists. Enter continues lists, Tab indents them. Notes autosave as plain `.md` files in `~/Documents/Sticky Notes`.
 - Fades to 40% when the mouse leaves and the window isn't focused.
 - **⌃⌥Space** shows or hides all stickies (no Accessibility permission needed).
 - Remembers each sticky's position and reopens them on launch.
 - Optional **Open at Login** toggle in the menu.
 - Lives in the menu bar, no Dock icon.
+
+## Note shortcuts
+
+All of these can be changed (see **Keybindings** below).
+
+| Action | Keys | Action | Keys |
+|---|---|---|---|
+| Show / hide notes (global) | ⌃⌘B | New note (global) | ⌃⌥N |
+| Browse / search notes | ⌘P | Actions menu | ⌘K |
+| New note | ⌘N | Pin / unpin | ⇧⌘P |
+| Open pinned note 1–9 | ⌘1–⌘9 | Next / previous recent note | ⌃⇥ / ⌃⇧⇥ |
+| Back / forward | ⌘[ / ⌘] | Find in note | ⌘F |
+| Zoom in / out / reset | ⌘= / ⌘- / ⌘0 | Hide notes window | Esc |
+| Copy note as Markdown | ⇧⌘C | Open note in new sticky | ⇧⌘N |
+| Bold / italic / underline | ⌘B / ⌘I / ⌘U | Strikethrough | ⇧⌘S |
+| Inline code / link | ⌘E / ⌘L | Code block | ⌥⌘C |
+| Heading 1 / 2 / 3 | ⌥⌘1 / 2 / 3 | Blockquote | ⇧⌘B |
+| Numbered / bullet / task list | ⇧⌘7 / 8 / 9 | Check / uncheck task | ⌘↩ |
+| Move line up / down | ⌥⇧↑ / ⌥⇧↓ | Delete, duplicate, show in Finder | ⌘K menu |
+
+## Keybindings
+
+Every shortcut lives in `~/.config/sticky/keybindings.json` (menu bar → **Edit Keybindings…**). Write keys like `"cmd+shift+p"`, `"ctrl+tab"` or `"opt+shift+up"`. Use `""` to turn one off, or a list like `["cmd+p", "cmd+o"]` for several. Changes apply as soon as you save.
 
 ## Requirements
 

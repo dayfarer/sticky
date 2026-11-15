@@ -1,6 +1,12 @@
 // Note stickies: a plain-text Markdown editor that styles itself as you type.
 import AppKit
 
+extension Notification.Name {
+    static let stickyRestyleNotes = Notification.Name("StickyRestyleNotes")
+}
+
+// MARK: - Notes on disk
+
 enum NotesFolder {
     static let url: URL = {
         let u = FileManager.default.homeDirectoryForCurrentUser
@@ -10,46 +16,137 @@ enum NotesFolder {
     }()
 }
 
+struct NoteInfo {
+    let id: String  // file name inside the notes folder, or a full path
+    let url: URL
+    let title: String
+    let body: String
+    let modified: Date
+}
+
+enum NotesLibrary {
+    static func url(for id: String) -> URL {
+        id.hasPrefix("/") ? URL(fileURLWithPath: id) : NotesFolder.url.appendingPathComponent(id)
+    }
+
+    static func newID() -> String {
+        "note-\(UUID().uuidString.prefix(8).lowercased()).md"
+    }
+
+    static func title(of text: String) -> String {
+        let first = text.split(separator: "\n").first { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        let t = first.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "#>-*[] \t")) } ?? ""
+        return t.isEmpty ? "New Note" : String(t.prefix(50))
+    }
+
+    /// Every .md note in the folder, most recently edited first.
+    static func all() -> [NoteInfo] {
+        let fm = FileManager.default
+        let urls = (try? fm.contentsOfDirectory(at: NotesFolder.url, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        return urls.filter { $0.pathExtension.lowercased() == "md" }.compactMap { u in
+            let body = (try? String(contentsOf: u, encoding: .utf8)) ?? ""
+            let mod = (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return NoteInfo(id: u.lastPathComponent, url: u, title: title(of: body), body: body, modified: mod)
+        }.sorted { $0.modified > $1.modified }
+    }
+
+    static func info(for id: String) -> NoteInfo? {
+        let u = url(for: id)
+        guard let body = try? String(contentsOf: u, encoding: .utf8) else { return nil }
+        let mod = (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+        return NoteInfo(id: id, url: u, title: title(of: body), body: body, modified: mod)
+    }
+}
+
+/// Pinned notes and zoom, saved in Application Support.
+@MainActor final class NotesState {
+    static let shared = NotesState()
+
+    private struct Saved: Codable {
+        var pinned: [String] = []
+        var zoom: Double = 1
+    }
+
+    private static let file = Store.file.deletingLastPathComponent().appendingPathComponent("notes-state.json")
+    private var saved = Saved()
+
+    private init() {
+        if let d = try? Data(contentsOf: Self.file), let s = try? JSONDecoder().decode(Saved.self, from: d) { saved = s }
+        Markdown.scale = CGFloat(saved.zoom)
+    }
+
+    private func save() {
+        if let d = try? JSONEncoder().encode(saved) { try? d.write(to: Self.file) }
+    }
+
+    var pinned: [String] { saved.pinned }
+
+    func isPinned(_ id: String) -> Bool { saved.pinned.contains(id) }
+
+    func togglePin(_ id: String) {
+        if let i = saved.pinned.firstIndex(of: id) { saved.pinned.remove(at: i) } else { saved.pinned.append(id) }
+        save()
+    }
+
+    func unpin(_ id: String) {
+        saved.pinned.removeAll { $0 == id }
+        save()
+    }
+
+    var zoom: CGFloat {
+        get { CGFloat(saved.zoom) }
+        set {
+            saved.zoom = Double(min(max(newValue, 0.6), 2.5))
+            Markdown.scale = CGFloat(saved.zoom)
+            save()
+            NotificationCenter.default.post(name: .stickyRestyleNotes, object: nil)
+        }
+    }
+}
+
 // MARK: - Live Markdown styling
 
 enum Markdown {
-    static let baseSize: CGFloat = 14
-    static let base = NSFont.systemFont(ofSize: baseSize)
-    static let mono = NSFont.monospacedSystemFont(ofSize: baseSize - 1, weight: .regular)
+    static var scale: CGFloat = 1
+    static var base: NSFont { .systemFont(ofSize: 14 * scale) }
+    static var mono: NSFont { .monospacedSystemFont(ofSize: 13 * scale, weight: .regular) }
     static let codeBackground = NSColor.secondaryLabelColor.withAlphaComponent(0.12)
 
     private static func rx(_ p: String, _ o: NSRegularExpression.Options = [.anchorsMatchLines]) -> NSRegularExpression {
         try! NSRegularExpression(pattern: p, options: o)
     }
 
-    static let fence   = rx(#"^```.*?^```[ \t]*$"#, [.anchorsMatchLines, .dotMatchesLineSeparators])
-    static let code    = rx(#"`([^`\n]+)`"#)
-    static let heading = rx(#"^(#{1,6})[ \t]+.*$"#)
-    static let bold    = rx(#"(\*\*|__)(?=\S)(.+?)(?<=\S)\1"#)
-    static let italic  = rx(#"(?<![\*\w])([\*_])(?![\s\*_])(.+?)(?<![\s\*_])\1(?![\*\w])"#)
-    static let strike  = rx(#"~~(?=\S)(.+?)(?<=\S)~~"#)
-    static let quote   = rx(#"^(>[ \t]?).*$"#)
-    static let bullet  = rx(#"^[ \t]*([-*+]|\d+[.)])[ \t]"#)
-    static let task    = rx(#"^([ \t]*[-*+][ \t])\[([ xX])\][ \t]?(.*)$"#)
-    static let link    = rx(#"\[([^\]\n]+)\]\(([^)\s]+)\)"#)
-    static let rule    = rx(#"^([-*_])\1{2,}[ \t]*$"#)
+    static let fence     = rx(#"^```.*?^```[ \t]*$"#, [.anchorsMatchLines, .dotMatchesLineSeparators])
+    static let code      = rx(#"`([^`\n]+)`"#)
+    static let heading   = rx(#"^(#{1,6})[ \t]+.*$"#)
+    static let bold      = rx(#"(\*\*|__)(?=\S)(.+?)(?<=\S)\1"#)
+    static let italic    = rx(#"(?<![\*\w])([\*_])(?![\s\*_])(.+?)(?<![\s\*_])\1(?![\*\w])"#)
+    static let strike    = rx(#"~~(?=\S)(.+?)(?<=\S)~~"#)
+    static let underline = rx(#"<u>(.+?)</u>"#)
+    static let quote     = rx(#"^(>[ \t]?).*$"#)
+    static let bullet    = rx(#"^[ \t]*([-*+]|\d+[.)])[ \t]"#)
+    static let task      = rx(#"^([ \t]*[-*+][ \t])\[([ xX])\][ \t]?(.*)$"#)
+    static let link      = rx(#"\[([^\]\n]+)\]\(([^)\s]+)\)"#)
+    static let rule      = rx(#"^([-*_])\1{2,}[ \t]*$"#)
 
     /// Restyles the whole note. Notes are small, so this is fast enough per keystroke.
     static func style(_ ts: NSTextStorage) {
         let str = ts.string
         let full = NSRange(location: 0, length: (str as NSString).length)
         let para = NSMutableParagraphStyle()
-        para.lineSpacing = 3
-        para.paragraphSpacing = 4
+        para.lineSpacing = 3 * scale
+        para.paragraphSpacing = 4 * scale
+        let base = self.base, mono = self.mono
         ts.setAttributes([.font: base, .foregroundColor: NSColor.labelColor, .paragraphStyle: para], range: full)
 
         let dim = NSColor.tertiaryLabelColor
         func each(_ r: NSRegularExpression, _ f: (NSTextCheckingResult) -> Void) {
             r.enumerateMatches(in: str, range: full) { m, _, _ in if let m { f(m) } }
         }
-        func dimEnds(_ r: NSRange, _ n: Int) {
-            ts.addAttribute(.foregroundColor, value: dim, range: NSRange(location: r.location, length: n))
-            ts.addAttribute(.foregroundColor, value: dim, range: NSRange(location: NSMaxRange(r) - n, length: n))
+        func dimEnds(_ r: NSRange, _ open: Int, _ close: Int? = nil) {
+            let close = close ?? open
+            ts.addAttribute(.foregroundColor, value: dim, range: NSRange(location: r.location, length: open))
+            ts.addAttribute(.foregroundColor, value: dim, range: NSRange(location: NSMaxRange(r) - close, length: close))
         }
 
         // Code first, so other rules skip it.
@@ -70,7 +167,7 @@ enum Markdown {
             guard !inCode(m.range) else { return }
             let sizes: [CGFloat] = [24, 20, 17, 15, 14, 14]
             let level = m.range(at: 1).length
-            ts.addAttribute(.font, value: NSFont.systemFont(ofSize: sizes[level - 1], weight: .bold), range: m.range)
+            ts.addAttribute(.font, value: NSFont.systemFont(ofSize: sizes[level - 1] * scale, weight: .bold), range: m.range)
             ts.addAttribute(.foregroundColor, value: dim, range: m.range(at: 1))
         }
         each(bold) { m in
@@ -89,6 +186,11 @@ enum Markdown {
                               .foregroundColor: NSColor.secondaryLabelColor], range: m.range)
             dimEnds(m.range, 2)
         }
+        each(underline) { m in
+            guard !inCode(m.range) else { return }
+            ts.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: m.range(at: 1))
+            dimEnds(m.range, 3, 4)
+        }
         each(quote) { m in
             guard !inCode(m.range) else { return }
             ts.addAttribute(.foregroundColor, value: NSColor.secondaryLabelColor, range: m.range)
@@ -102,8 +204,7 @@ enum Markdown {
             guard !inCode(m.range) else { return }
             let box = NSRange(location: NSMaxRange(m.range(at: 1)), length: 3)
             ts.addAttributes([.foregroundColor: NSColor.controlAccentColor, .font: mono], range: box)
-            let checked = (str as NSString).substring(with: m.range(at: 2)) != " "
-            if checked {
+            if (str as NSString).substring(with: m.range(at: 2)) != " " {
                 ts.addAttributes([.strikethroughStyle: NSUnderlineStyle.single.rawValue,
                                   .foregroundColor: NSColor.secondaryLabelColor], range: m.range(at: 3))
             }
@@ -129,30 +230,44 @@ enum Markdown {
     }
 }
 
-// MARK: - Text view with shortcuts and clickable checkboxes
+// MARK: - Text view: formatting commands and clickable checkboxes
 
 final class MarkdownTextView: NSTextView {
+    private enum LineKind { case bullet, ordered, task, quote }
+
+    private static let prefix = try! NSRegularExpression(
+        pattern: #"^([ \t]*)([-*+] \[[ xX]\] ?|[-*+] |\d+[.)] |> ?)?(.*)$"#)
+    private static let headingPrefix = try! NSRegularExpression(pattern: #"^(#{1,6})[ \t]+"#)
+
     override func mouseDown(with event: NSEvent) {
         let idx = characterIndexForInsertion(at: convert(event.locationInWindow, from: nil))
         if toggleCheckbox(at: idx) { return }
         super.mouseDown(with: event)
     }
 
-    override func performKeyEquivalent(with e: NSEvent) -> Bool {
-        guard window?.firstResponder === self else { return super.performKeyEquivalent(with: e) }
-        let flags = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        let key = e.charactersIgnoringModifiers?.lowercased() ?? ""
-        if flags == .command {
-            switch key {
-            case "b": wrap("**"); return true
-            case "i": wrap("*"); return true
-            case "e": wrap("`"); return true
-            case "l": toggleChecklistLine(); return true
-            default: break
-            }
+    /// Runs a formatting action. Returns false if the action isn't a formatting one.
+    func perform(_ a: Action) -> Bool {
+        switch a {
+        case .bold: wrap("**")
+        case .italic: wrap("*")
+        case .underline: wrap("<u>", "</u>")
+        case .strike: wrap("~~")
+        case .code: wrap("`")
+        case .link: insertLink()
+        case .heading1: setHeading(1)
+        case .heading2: setHeading(2)
+        case .heading3: setHeading(3)
+        case .codeBlock: toggleCodeBlock()
+        case .quote: setLineKind(.quote)
+        case .orderedList: setLineKind(.ordered)
+        case .bulletList: setLineKind(.bullet)
+        case .taskList: setLineKind(.task)
+        case .toggleTask: toggleTasks()
+        case .moveLineUp: moveLines(up: true)
+        case .moveLineDown: moveLines(up: false)
+        default: return false
         }
-        if flags == [.command, .shift], key == "x" { wrap("~~"); return true }
-        return super.performKeyEquivalent(with: e)
+        return true
     }
 
     /// Undo-friendly replace.
@@ -162,70 +277,201 @@ final class MarkdownTextView: NSTextView {
         didChangeText()
     }
 
+    private var ns: NSString { string as NSString }
+
     private func toggleCheckbox(at idx: Int) -> Bool {
-        let s = string as NSString
-        guard s.length > 0, idx <= s.length else { return false }
-        let line = s.lineRange(for: NSRange(location: min(idx, s.length - 1), length: 0))
-        let text = s.substring(with: line)
+        guard ns.length > 0, idx <= ns.length else { return false }
+        let line = ns.lineRange(for: NSRange(location: min(idx, ns.length - 1), length: 0))
+        let text = ns.substring(with: line)
         guard let m = Markdown.task.firstMatch(in: text, range: NSRange(location: 0, length: (text as NSString).length))
         else { return false }
         let boxStart = line.location + NSMaxRange(m.range(at: 1))
         guard idx >= boxStart, idx <= boxStart + 3 else { return false }
         let inner = NSRange(location: boxStart + 1, length: 1)
-        replace(inner, with: s.substring(with: inner) == " " ? "x" : " ")
+        replace(inner, with: ns.substring(with: inner) == " " ? "x" : " ")
         return true
     }
 
-    private func wrap(_ mark: String) {
+    private func wrap(_ open: String, _ close: String? = nil) {
+        let close = close ?? open
         let r = selectedRange()
-        let sel = (string as NSString).substring(with: r)
-        let n = (mark as NSString).length
-        if sel.hasPrefix(mark), sel.hasSuffix(mark), (sel as NSString).length >= 2 * n {
-            let inner = String(sel.dropFirst(mark.count).dropLast(mark.count))
+        let sel = ns.substring(with: r)
+        let o = (open as NSString).length, c = (close as NSString).length
+        // Markers just outside the selection: remove them.
+        if r.location >= o, NSMaxRange(r) + c <= ns.length,
+           ns.substring(with: NSRange(location: r.location - o, length: o)) == open,
+           ns.substring(with: NSRange(location: NSMaxRange(r), length: c)) == close {
+            replace(NSRange(location: r.location - o, length: r.length + o + c), with: sel)
+            setSelectedRange(NSRange(location: r.location - o, length: r.length))
+            return
+        }
+        // Markers inside the selection: remove them.
+        let sl = (sel as NSString).length
+        if sel.hasPrefix(open), sel.hasSuffix(close), sl >= o + c {
+            let inner = (sel as NSString).substring(with: NSRange(location: o, length: sl - o - c))
             replace(r, with: inner)
             setSelectedRange(NSRange(location: r.location, length: (inner as NSString).length))
             return
         }
-        replace(r, with: mark + sel + mark)
-        setSelectedRange(NSRange(location: r.location + n, length: (sel as NSString).length))
+        replace(r, with: open + sel + close)
+        setSelectedRange(NSRange(location: r.location + o, length: r.length))
     }
 
-    private func toggleChecklistLine() {
-        let s = string as NSString
-        var line = s.lineRange(for: NSRange(location: selectedRange().location, length: 0))
-        if line.length > 0, s.character(at: NSMaxRange(line) - 1) == 10 { line.length -= 1 }
-        let text = s.substring(with: line)
-        let whole = NSRange(location: 0, length: (text as NSString).length)
-        let rules: [(String, String)] = [
-            (#"^([ \t]*)[-*+] \[[ xX]\] ?"#, "$1"),
-            (#"^([ \t]*)[-*+] "#, "$1- [ ] "),
-            (#"^([ \t]*)"#, "$1- [ ] "),
-        ]
-        for (pattern, template) in rules {
-            let r = try! NSRegularExpression(pattern: pattern)
-            guard r.firstMatch(in: text, range: whole) != nil else { continue }
-            let out = r.stringByReplacingMatches(in: text, range: whole, withTemplate: template)
-            replace(line, with: out)
-            setSelectedRange(NSRange(location: line.location + (out as NSString).length, length: 0))
-            return
+    private func insertLink() {
+        let r = selectedRange()
+        let sel = ns.substring(with: r)
+        if sel.hasPrefix("http://") || sel.hasPrefix("https://") {
+            replace(r, with: "[](\(sel))")
+            setSelectedRange(NSRange(location: r.location + 1, length: 0))
+        } else if sel.isEmpty {
+            replace(r, with: "[](url)")
+            setSelectedRange(NSRange(location: r.location + 1, length: 0))
+        } else {
+            replace(r, with: "[\(sel)](url)")
+            setSelectedRange(NSRange(location: r.location + (sel as NSString).length + 3, length: 3))
+        }
+    }
+
+    /// Replaces the selected lines with f(lines), keeping the cursor sensible.
+    private func transformLines(_ f: ([String]) -> [String]) {
+        let sel = selectedRange()
+        var r = ns.lineRange(for: sel)
+        var text = ns.substring(with: r)
+        if text.hasSuffix("\n") { text.removeLast(); r.length -= 1 }
+        let lines = text.components(separatedBy: "\n")
+        let out = f(lines).joined(separator: "\n")
+        let outLen = (out as NSString).length
+        replace(r, with: out)
+        if lines.count == 1 {
+            let delta = outLen - r.length
+            setSelectedRange(NSRange(location: min(max(r.location, sel.location + delta), r.location + outLen), length: 0))
+        } else {
+            setSelectedRange(NSRange(location: r.location, length: outLen))
+        }
+    }
+
+    private func split(_ line: String) -> (indent: String, kind: LineKind?, rest: String) {
+        let l = line as NSString
+        guard let m = Self.prefix.firstMatch(in: line, range: NSRange(location: 0, length: l.length)) else {
+            return ("", nil, line)
+        }
+        let indent = l.substring(with: m.range(at: 1))
+        let rest = l.substring(with: m.range(at: 3))
+        var kind: LineKind?
+        if m.range(at: 2).location != NSNotFound {
+            let p = l.substring(with: m.range(at: 2))
+            if p.contains("[") { kind = .task }
+            else if p.hasPrefix(">") { kind = .quote }
+            else if p.first?.isNumber == true { kind = .ordered }
+            else { kind = .bullet }
+        }
+        return (indent, kind, rest)
+    }
+
+    private func setLineKind(_ kind: LineKind) {
+        transformLines { lines in
+            let parts = lines.map(split)
+            let nonEmpty = parts.filter { !$0.rest.isEmpty || $0.kind != nil }
+            let turnOff = !nonEmpty.isEmpty && nonEmpty.allSatisfy { $0.kind == kind }
+            var n = 0
+            return parts.map { p in
+                if turnOff { return p.indent + p.rest }
+                if lines.count > 1, p.rest.isEmpty, p.kind == nil { return p.indent }
+                n += 1
+                switch kind {
+                case .bullet: return p.indent + "- " + p.rest
+                case .ordered: return p.indent + "\(n). " + p.rest
+                case .task: return p.indent + "- [ ] " + p.rest
+                case .quote: return p.indent + "> " + p.rest
+                }
+            }
+        }
+    }
+
+    private func setHeading(_ level: Int) {
+        transformLines { lines in
+            lines.map { line in
+                let l = line as NSString
+                var had = 0
+                var body = line
+                if let m = Self.headingPrefix.firstMatch(in: line, range: NSRange(location: 0, length: l.length)) {
+                    had = m.range(at: 1).length
+                    body = l.substring(from: m.range.length)
+                }
+                return had == level ? body : String(repeating: "#", count: level) + " " + body
+            }
+        }
+    }
+
+    private func toggleCodeBlock() {
+        let sel = selectedRange()
+        let r = ns.lineRange(for: sel)
+        let lines = ns.substring(with: r).components(separatedBy: "\n")
+        let empty = sel.length == 0 && ns.substring(with: r).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        transformLines { lines in
+            if lines.count >= 2, lines.first?.hasPrefix("```") == true, lines.last == "```" {
+                return Array(lines.dropFirst().dropLast())
+            }
+            return ["```"] + lines + ["```"]
+        }
+        if empty, lines.count <= 2 { setSelectedRange(NSRange(location: r.location + 4, length: 0)) }
+    }
+
+    private func toggleTasks() {
+        transformLines { lines in
+            lines.map { line in
+                let l = line as NSString
+                if let m = Markdown.task.firstMatch(in: line, range: NSRange(location: 0, length: l.length)) {
+                    let box = m.range(at: 2)
+                    return l.replacingCharacters(in: box, with: l.substring(with: box) == " " ? "x" : " ")
+                }
+                let p = split(line)
+                return p.indent + "- [ ] " + p.rest
+            }
+        }
+    }
+
+    private func moveLines(up: Bool) {
+        let sel = selectedRange()
+        let block = ns.lineRange(for: sel)
+        let offset = sel.location - block.location
+        var blockText = ns.substring(with: block)
+        if up {
+            guard block.location > 0 else { return }
+            let prev = ns.lineRange(for: NSRange(location: block.location - 1, length: 0))
+            var prevText = ns.substring(with: prev)
+            if !blockText.hasSuffix("\n") { blockText += "\n"; prevText.removeLast() }
+            replace(NSRange(location: prev.location, length: prev.length + block.length), with: blockText + prevText)
+            setSelectedRange(NSRange(location: prev.location + offset, length: sel.length))
+        } else {
+            guard NSMaxRange(block) < ns.length else { return }
+            let next = ns.lineRange(for: NSRange(location: NSMaxRange(block), length: 0))
+            var nextText = ns.substring(with: next)
+            if !nextText.hasSuffix("\n") { nextText += "\n"; blockText.removeLast() }
+            replace(NSRange(location: block.location, length: block.length + next.length), with: nextText + blockText)
+            setSelectedRange(NSRange(location: block.location + (nextText as NSString).length + offset, length: sel.length))
         }
     }
 }
 
-// MARK: - Editor (loads, styles, autosaves one .md file)
+// MARK: - Editor (loads, styles, autosaves one .md file at a time)
 
-final class NoteEditor: NSObject, NSTextViewDelegate, NSTextStorageDelegate {
-    let fileURL: URL
+@MainActor final class NoteEditor: NSObject, NSTextViewDelegate, @preconcurrency NSTextStorageDelegate {
+    private(set) var noteID: String
+    private(set) var fileURL: URL
     let scroll: NSScrollView
     let textView: MarkdownTextView
     var onTitle: ((String) -> Void)?
     private var pendingSave: DispatchWorkItem?
+    private var dirty = false
+    private var loading = false
 
     private static let listPrefix = try! NSRegularExpression(
         pattern: #"^([ \t]*)([-*+] \[[ xX]\] |[-*+] |(\d+)([.)]) |> )"#)
 
-    init(fileURL: URL, frame: NSRect) {
-        self.fileURL = fileURL
+    init(noteID: String, frame: NSRect) {
+        self.noteID = noteID
+        fileURL = NotesLibrary.url(for: noteID)
         scroll = NSScrollView(frame: frame)
         scroll.autoresizingMask = [.width, .height]
         scroll.hasVerticalScroller = true
@@ -245,7 +491,8 @@ final class NoteEditor: NSObject, NSTextViewDelegate, NSTextStorageDelegate {
         textView.isRichText = false
         textView.allowsUndo = true
         textView.drawsBackground = false
-        textView.font = Markdown.base
+        textView.usesFindBar = true
+        textView.isIncrementalSearchingEnabled = true
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
@@ -255,19 +502,56 @@ final class NoteEditor: NSObject, NSTextViewDelegate, NSTextStorageDelegate {
 
         textView.delegate = self
         textView.textStorage?.delegate = self
-        textView.string = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
+        NotificationCenter.default.addObserver(forName: .stickyRestyleNotes, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.restyle() }
+        }
+        load(noteID)
+    }
+
+    var title: String { NotesLibrary.title(of: textView.string) }
+    var text: String { textView.string }
+
+    /// Shows another note in this editor (saves the current one first).
+    func load(_ id: String, initialText: String? = nil) {
+        saveNow()
+        noteID = id
+        fileURL = NotesLibrary.url(for: id)
+        loading = true
+        textView.string = initialText ?? (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
+        loading = false
+        dirty = initialText != nil
+        restyle()
+        textView.undoManager?.removeAllActions()
+        let end = (textView.string as NSString).length
+        textView.setSelectedRange(NSRange(location: initialText != nil ? end : 0, length: 0))
+        textView.scrollToBeginningOfDocument(nil)
+        if dirty { saveNow() }
+        onTitle?(title)
+    }
+
+    func restyle() {
         if let ts = textView.textStorage { Markdown.style(ts) }
+        textView.typingAttributes[.font] = Markdown.base
     }
 
-    var title: String {
-        let first = textView.string.split(separator: "\n").first { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-        let t = first.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "#>-*[] \t")) } ?? ""
-        return t.isEmpty ? "New Note" : String(t.prefix(40))
-    }
-
+    /// Writes the note if it has unsaved changes.
     func saveNow() {
         pendingSave?.cancel()
+        guard dirty else { return }
+        dirty = false
         try? textView.string.write(to: fileURL, atomically: true, encoding: .utf8)
+    }
+
+    /// Forget unsaved changes (used before deleting a note).
+    func discard() {
+        pendingSave?.cancel()
+        dirty = false
+    }
+
+    func showFind() {
+        let item = NSMenuItem()
+        item.tag = NSTextFinder.Action.showFindInterface.rawValue
+        textView.performTextFinderAction(item)
     }
 
     // Restyle after every edit.
@@ -279,6 +563,8 @@ final class NoteEditor: NSObject, NSTextViewDelegate, NSTextStorageDelegate {
 
     // Autosave half a second after you stop typing.
     func textDidChange(_ n: Notification) {
+        guard !loading else { return }
+        dirty = true
         onTitle?(title)
         pendingSave?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.saveNow() }

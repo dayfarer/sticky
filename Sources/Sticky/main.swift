@@ -47,6 +47,14 @@ func shellQuote(_ s: String) -> String {
 final class StickyPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    /// Sees every key press first, so custom keybindings win over the text view.
+    var keyHandler: ((NSEvent) -> Bool)?
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown, let h = keyHandler, h(event) { return }
+        super.sendEvent(event)
+    }
 }
 
 /// Tells us when the mouse enters or leaves the window, for the fade effect.
@@ -148,14 +156,167 @@ final class HoverView: NSView {
     }
 
     private func setUpNote(in container: NSView) {
-        let name = config.note ?? "note-\(config.id.uuidString.prefix(8).lowercased()).md"
-        config.note = name
-        let file = name.hasPrefix("/") ? URL(fileURLWithPath: name) : NotesFolder.url.appendingPathComponent(name)
-        let editor = NoteEditor(fileURL: file, frame: container.bounds)
-        editor.onTitle = { [weak self] t in self?.panel.title = t }
+        let id = config.note ?? NotesLibrary.newID()
+        config.note = id
+        let editor = NoteEditor(noteID: id, frame: container.bounds)
+        editor.onTitle = { [weak self] t in self?.updateNoteTitle(t) }
         container.addSubview(editor.scroll)
-        panel.title = editor.title
         note = editor
+        history = [id]
+        historyIndex = 0
+        updateNoteTitle(editor.title)
+        panel.keyHandler = { [weak self] e in self?.handleNoteKey(e) ?? false }
+    }
+
+    // MARK: Note commands
+
+    var isNote: Bool { note != nil }
+    private var history: [String] = []
+    private var historyIndex = 0
+
+    private func updateNoteTitle(_ t: String) {
+        guard let id = note?.noteID else { return }
+        panel.title = (NotesState.shared.isPinned(id) ? "📌 " : "") + t
+    }
+
+    private func handleNoteKey(_ e: NSEvent) -> Bool {
+        guard let note, let action = Keymap.shared.localAction(for: e) else { return false }
+        // Let Esc close the find bar instead of hiding the window.
+        if action == .hideNotes, panel.firstResponder !== note.textView { return false }
+        return perform(action)
+    }
+
+    @discardableResult
+    func perform(_ a: Action) -> Bool {
+        guard let note else { return false }
+        if note.textView.perform(a) { return true }
+        if let i = a.pinIndex { openPinned(i); return true }
+        switch a {
+        case .newNote: switchTo(NotesLibrary.newID())
+        case .browseNotes: showBrowser()
+        case .actionPanel: showActions()
+        case .togglePin:
+            note.saveNow()
+            NotesState.shared.togglePin(note.noteID)
+            updateNoteTitle(note.title)
+        case .deleteNote: deleteCurrent()
+        case .duplicateNote:
+            let id = NotesLibrary.newID()
+            switchTo(id, initialText: note.text)
+        case .copyNote:
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(note.text, forType: .string)
+        case .revealNote:
+            note.saveNow()
+            NSWorkspace.shared.activateFileViewerSelecting([note.fileURL])
+        case .openInNewSticky:
+            note.saveNow()
+            app?.open(StickyConfig(kind: .note, note: note.noteID))
+        case .back:
+            guard historyIndex > 0 else { return true }
+            historyIndex -= 1
+            switchTo(history[historyIndex], record: false)
+        case .forward:
+            guard historyIndex < history.count - 1 else { return true }
+            historyIndex += 1
+            switchTo(history[historyIndex], record: false)
+        case .nextRecent: cycleRecent(1)
+        case .prevRecent: cycleRecent(-1)
+        case .zoomIn: NotesState.shared.zoom += 0.1
+        case .zoomOut: NotesState.shared.zoom -= 0.1
+        case .zoomReset: NotesState.shared.zoom = 1
+        case .find: note.showFind()
+        case .hideNotes, .toggleNotes, .newNoteGlobal, .toggleAll, .editKeybindings:
+            app?.runGlobal(a)
+        default: return false
+        }
+        return true
+    }
+
+    func switchTo(_ id: String, initialText: String? = nil, record: Bool = true) {
+        guard let note else { return }
+        note.load(id, initialText: initialText)
+        config.note = id
+        app?.persist()
+        if record {
+            history = Array(history.prefix(historyIndex + 1)) + [id]
+            historyIndex = history.count - 1
+        }
+        updateNoteTitle(note.title)
+        panel.makeFirstResponder(note.textView)
+    }
+
+    private func newNote(titled title: String) {
+        switchTo(NotesLibrary.newID(), initialText: "# \(title)\n\n")
+    }
+
+    private func openPinned(_ i: Int) {
+        let pins = NotesState.shared.pinned
+        guard i < pins.count else { NSSound.beep(); return }
+        switchTo(pins[i])
+    }
+
+    private func cycleRecent(_ step: Int) {
+        guard let note else { return }
+        note.saveNow()
+        let ids = NotesLibrary.all().map(\.id)
+        guard !ids.isEmpty else { return }
+        let i = ids.firstIndex(of: note.noteID) ?? (step > 0 ? -1 : ids.count)
+        let next = ((i + step) % ids.count + ids.count) % ids.count
+        if ids[next] != note.noteID { switchTo(ids[next]) }
+    }
+
+    private func deleteCurrent() {
+        guard let note else { return }
+        let id = note.noteID
+        note.discard()
+        if FileManager.default.fileExists(atPath: note.fileURL.path) {
+            try? FileManager.default.trashItem(at: note.fileURL, resultingItemURL: nil)
+        }
+        NotesState.shared.unpin(id)
+        history.removeAll { $0 == id }
+        historyIndex = max(0, min(historyIndex, history.count - 1))
+        switchTo(NotesLibrary.all().first?.id ?? NotesLibrary.newID())
+    }
+
+    private func relative(_ d: Date) -> String {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .abbreviated
+        return f.localizedString(for: d, relativeTo: Date())
+    }
+
+    private func showBrowser() {
+        guard let note else { return }
+        note.saveNow()
+        let notes = NotesLibrary.all()
+        let byID = Dictionary(notes.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let pins = NotesState.shared.pinned
+        let pinActions: [Action] = [.pinned1, .pinned2, .pinned3, .pinned4, .pinned5, .pinned6, .pinned7, .pinned8, .pinned9]
+        var items: [QuickPicker.Item] = []
+        for (i, id) in pins.enumerated() {
+            guard let n = byID[id] ?? NotesLibrary.info(for: id) else { continue }
+            let key = i < pinActions.count ? Keymap.shared.shortcut(pinActions[i]) : ""
+            items.append(.init(title: "📌 " + n.title, detail: key, searchText: n.body) { [weak self] in self?.switchTo(id) })
+        }
+        for n in notes where !pins.contains(n.id) {
+            let current = n.id == note.noteID ? "current · " : ""
+            items.append(.init(title: n.title, detail: current + relative(n.modified), searchText: n.body) { [weak self] in
+                self?.switchTo(n.id)
+            })
+        }
+        QuickPicker.shared.present(placeholder: "Search notes…", items: items, over: panel) { [weak self] q in
+            q.isEmpty ? nil : .init(title: "Create note “\(q)”", detail: Keymap.shared.shortcut(.newNote)) { self?.newNote(titled: q) }
+        }
+    }
+
+    private func showActions() {
+        let skip: Set<Action> = [.actionPanel, .pinned2, .pinned3, .pinned4, .pinned5, .pinned6, .pinned7, .pinned8, .pinned9]
+        let items = Action.allCases.filter { !skip.contains($0) }.map { a in
+            QuickPicker.Item(title: a.title, detail: Keymap.shared.combos(a).map(\.display).joined(separator: "  ")) { [weak self] in
+                self?.perform(a)
+            }
+        }
+        QuickPicker.shared.present(placeholder: "Search actions…", items: items, over: panel)
     }
 
     private func setUpWeb(in container: NSView) {
@@ -238,7 +399,10 @@ final class HoverView: NSView {
     }
 
     // NSWindowDelegate
-    func windowDidBecomeKey(_ n: Notification) { updateAlpha() }
+    func windowDidBecomeKey(_ n: Notification) {
+        updateAlpha()
+        if isNote { app?.noteBecameKey(self) }
+    }
     func windowDidResignKey(_ n: Notification) { updateAlpha() }
     func windowDidMove(_ n: Notification) { saveFrame() }
     func windowDidEndLiveResize(_ n: Notification) { saveFrame() }
@@ -265,14 +429,20 @@ final class HoverView: NSView {
     private var statusItem: NSStatusItem!
     private var stickies: [StickyController] = []
     private var hidden = false
-    private var hotKeyRef: EventHotKeyRef?
-    private var noteHotKeyRef: EventHotKeyRef?
+    private var hotKeyRefs: [EventHotKeyRef] = []
+    private let globalActions: [Action] = Action.allCases.filter(\.isGlobal)
 
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.accessory)  // menu bar only, no Dock icon
         buildMainMenu()
         buildStatusMenu()
-        registerHotKey()
+        installHotKeyHandler()
+        registerGlobalHotKeys()
+        Keymap.shared.onChange = { [weak self] in
+            self?.registerGlobalHotKeys()
+            self?.buildStatusMenu()
+            if let p = Keymap.shared.problems.first { NSSound.beep(); print("Keybindings: \(p)") }
+        }
         enableLoginOnFirstRun()
 
         for c in Store.load() { open(c) }
@@ -281,19 +451,24 @@ final class HoverView: NSView {
 
     // Menu bar icon
     private func buildStatusMenu() {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "note.text", accessibilityDescription: "Sticky")
+        if statusItem == nil {
+            statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+            statusItem.button?.image = NSImage(systemSymbolName: "note.text", accessibilityDescription: "Sticky")
+        }
+        let k = Keymap.shared
         let m = NSMenu()
-        add(m, "New Note   ⌃⌥N", #selector(newNote))
-        add(m, "Open Note…", #selector(openNote))
+        add(m, "Show / Hide Notes   \(k.shortcut(.toggleNotes))", #selector(toggleNotes))
+        add(m, "New Note   \(k.shortcut(.newNoteGlobal))", #selector(newNote))
+        add(m, "Open Note File…", #selector(openNote))
         add(m, "Open Notes Folder", #selector(revealNotes))
+        add(m, "Edit Keybindings…", #selector(editKeybindings))
         m.addItem(.separator())
         add(m, "New Claude Code Sticky (web)", #selector(newClaudeCodeWeb))
         add(m, "New Claude CLI Sticky…", #selector(newClaude))
         add(m, "New Terminal Sticky…", #selector(newTerminal))
         add(m, "New Web Sticky…", #selector(newWeb))
         m.addItem(.separator())
-        add(m, "Show / Hide All   ⌃⌥Space", #selector(toggleAll))
+        add(m, "Show / Hide All   \(k.shortcut(.toggleAll))", #selector(toggleAll))
         add(m, "Open Saved Stickies File", #selector(revealStore))
         loginItem = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin), keyEquivalent: "")
         loginItem.target = self
@@ -334,24 +509,80 @@ final class HoverView: NSView {
         NSApp.mainMenu = main
     }
 
-    // Global hotkey ⌃⌥Space. Uses Carbon, so no Accessibility permission needed.
-    private func registerHotKey() {
+    // Global hotkeys from the keymap. Uses Carbon, so no Accessibility permission needed.
+    private func installHotKeyHandler() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { _, event, userData in
             var hk = EventHotKeyID()
             GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
                               nil, MemoryLayout<EventHotKeyID>.size, nil, &hk)
-            let id = hk.id
+            let id = Int(hk.id)
             let me = Unmanaged<AppDelegate>.fromOpaque(userData!).takeUnretainedValue()
-            DispatchQueue.main.async { if id == 2 { me.newNote() } else { me.toggleAll() } }
+            DispatchQueue.main.async { MainActor.assumeIsolated { me.hotKeyPressed(id) } }
             return noErr
         }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
-        RegisterEventHotKey(UInt32(kVK_Space), UInt32(controlKey | optionKey),
-                            EventHotKeyID(signature: OSType(0x5354_4B59), id: 1),
-                            GetApplicationEventTarget(), 0, &hotKeyRef)
-        RegisterEventHotKey(UInt32(kVK_ANSI_N), UInt32(controlKey | optionKey),
-                            EventHotKeyID(signature: OSType(0x5354_4B59), id: 2),
-                            GetApplicationEventTarget(), 0, &noteHotKeyRef)
+    }
+
+    private func registerGlobalHotKeys() {
+        hotKeyRefs.forEach { UnregisterEventHotKey($0) }
+        hotKeyRefs = []
+        for (i, a) in globalActions.enumerated() {
+            for combo in Keymap.shared.combos(a) {
+                var ref: EventHotKeyRef?
+                RegisterEventHotKey(UInt32(combo.keyCode), combo.carbonMods,
+                                    EventHotKeyID(signature: OSType(0x5354_4B59), id: UInt32(i)),
+                                    GetApplicationEventTarget(), 0, &ref)
+                if let ref { hotKeyRefs.append(ref) }
+            }
+        }
+    }
+
+    private func hotKeyPressed(_ i: Int) {
+        guard i < globalActions.count else { return }
+        runGlobal(globalActions[i])
+    }
+
+    func runGlobal(_ a: Action) {
+        switch a {
+        case .toggleNotes: toggleNotes()
+        case .newNoteGlobal: newNote()
+        case .toggleAll: toggleAll()
+        case .hideNotes: hideNotes()
+        case .editKeybindings: editKeybindings()
+        default: break
+        }
+    }
+
+    private var noteStickies: [StickyController] { stickies.filter(\.isNote) }
+    private weak var lastNote: StickyController?
+
+    /// Like Raycast Notes: one hotkey shows the notes window, or hides it if it's in front.
+    @objc func toggleNotes() {
+        let notes = noteStickies
+        if notes.isEmpty {
+            open(StickyConfig(kind: .note, note: NotesLibrary.all().first?.id))
+            return
+        }
+        if notes.contains(where: { $0.panel.isKeyWindow }) {
+            hideNotes()
+        } else {
+            notes.forEach { $0.show() }
+            (lastNote ?? notes.last)?.show()
+        }
+    }
+
+    func hideNotes() {
+        noteStickies.forEach { $0.panel.orderOut(nil) }
+    }
+
+    func noteBecameKey(_ s: StickyController) { lastNote = s }
+
+    @objc func editKeybindings() {
+        if let existing = stickies.first(where: { $0.config.note == Keymap.file.path }) {
+            existing.show()
+        } else {
+            open(StickyConfig(kind: .note, note: Keymap.file.path))
+        }
     }
 
     // Actions
@@ -372,7 +603,12 @@ final class HoverView: NSView {
     }
 
     @objc func newNote() {
-        open(StickyConfig(kind: .note))
+        if let s = lastNote ?? noteStickies.last {
+            s.show()
+            s.perform(.newNote)
+        } else {
+            open(StickyConfig(kind: .note))
+        }
     }
 
     @objc func openNote() {
