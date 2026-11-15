@@ -42,6 +42,8 @@ Every shortcut lives in `~/.config/sticky/keybindings.json` (menu bar → **Edit
 
 Web stickies can run browser extensions through Apple's WebExtension support (macOS 15.4+). Menu bar → **Add Extension…** and pick an unpacked extension folder, a `.zip` (like GitHub's *Download ZIP*), or a `.crx`. Extensions live in `~/.config/sticky/extensions/`; delete a folder and relaunch to remove one. Each extension with a popup gets a menu item that opens its settings.
 
+WebKit doesn't send extensions the `runtime.onInstalled` event in apps like Sticky, so Sticky adds a tiny script in front of each extension's background script that fires it once per version. That's where many extensions save their default settings.
+
 Simple extensions that restyle or tweak pages work well (for example [Better Canvas](https://github.com/UseBetterCanvas/bettercanvas)). Extensions that talk to a desktop app, like password managers, won't.
 
 ## Requirements

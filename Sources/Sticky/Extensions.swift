@@ -37,6 +37,7 @@ enum ExtensionsFolder {
     }
 
     func load(_ dir: URL) async {
+        addInstallShim(to: dir)
         do {
             let ext = try await WKWebExtension(resourceBaseURL: dir)
             let ctx = WKWebExtensionContext(for: ext)
@@ -47,9 +48,79 @@ enum ExtensionsFolder {
             for m in ext.allRequestedMatchPatterns { ctx.setPermissionStatus(.grantedExplicitly, for: m) }
             try controller.load(ctx)
             contexts.append(ctx)
+            for e in ext.errors { log("\(dir.lastPathComponent) manifest issue: \(e.localizedDescription)") }
+            // Start the background script now, so first-run setup (runtime.onInstalled) happens.
+            if ext.hasBackgroundContent {
+                ctx.loadBackgroundContent { [weak self] error in
+                    MainActor.assumeIsolated {
+                        self?.log("\(dir.lastPathComponent) background: \(error?.localizedDescription ?? "loaded")")
+                    }
+                }
+            }
         } catch {
             errors.append("\(dir.lastPathComponent): \(error.localizedDescription)")
             print("Extension failed to load: \(dir.lastPathComponent): \(error)")
+        }
+    }
+
+    // MARK: onInstalled shim
+    //
+    // WebKit doesn't fire runtime.onInstalled for apps like Sticky, and many extensions save
+    // their default settings there. This adds a tiny script in front of the extension's
+    // background script that fires onInstalled once per version.
+
+    private static let shimName = "sticky-oninstalled-shim.js"
+    private static let shim = """
+    // Added by Sticky: fires runtime.onInstalled once per version (WebKit hosts don't).
+    (() => {
+      const KEY = "__sticky_installed_version";
+      const ev = chrome.runtime.onInstalled;
+      const listeners = [];
+      const add = ev.addListener.bind(ev);
+      try { ev.addListener = (fn) => { listeners.push(fn); add(fn); }; } catch (e) {}
+      setTimeout(async () => {
+        const version = chrome.runtime.getManifest().version;
+        const got = await chrome.storage.local.get(KEY);
+        const prev = got[KEY];
+        if (prev === version) return;
+        await chrome.storage.local.set({ [KEY]: version });
+        const details = prev ? { reason: "update", previousVersion: prev } : { reason: "install" };
+        for (const fn of listeners) { try { await fn(details); } catch (e) { console.error(e); } }
+      }, 0);
+    })();
+    """
+
+    /// Rewrites the manifest's background entry to load the shim first. Safe to run every launch.
+    private func addInstallShim(to dir: URL) {
+        let manifestURL = dir.appendingPathComponent("manifest.json")
+        guard let data = try? Data(contentsOf: manifestURL),
+              var manifest = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var bg = manifest["background"] as? [String: Any] else { return }
+        let perms = (manifest["permissions"] as? [String]) ?? []
+        guard perms.contains("storage") else { return }  // the shim needs chrome.storage
+
+        try? Self.shim.write(to: dir.appendingPathComponent(Self.shimName), atomically: true, encoding: .utf8)
+
+        if let worker = bg["service_worker"] as? String {
+            guard !worker.hasPrefix("sticky-bg") else { return }  // already done
+            let wrapper = "sticky-bg.js"
+            let isModule = (bg["type"] as? String) == "module"
+            let body = isModule
+                ? "import \"./\(Self.shimName)\";\nimport \"./\(worker)\";\n"
+                : "importScripts(\"\(Self.shimName)\", \"\(worker)\");\n"
+            try? body.write(to: dir.appendingPathComponent(wrapper), atomically: true, encoding: .utf8)
+            bg["service_worker"] = wrapper
+        } else if var scripts = bg["scripts"] as? [String] {
+            guard scripts.first != Self.shimName else { return }
+            scripts.insert(Self.shimName, at: 0)
+            bg["scripts"] = scripts
+        } else {
+            return
+        }
+        manifest["background"] = bg
+        if let out = try? JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .withoutEscapingSlashes]) {
+            try? out.write(to: manifestURL)
+            log("\(dir.lastPathComponent): added onInstalled shim")
         }
     }
 
@@ -64,11 +135,17 @@ enum ExtensionsFolder {
     /// Opens the extension's toolbar popup (its settings, for most extensions).
     func openPopup(_ ctx: WKWebExtensionContext) {
         NSApp.activate(ignoringOtherApps: true)
+        log("openPopup \(name(ctx)) action=\(ctx.action(for: nil) != nil) options=\(ctx.optionsPageURL?.absoluteString ?? "nil") base=\(ctx.baseURL)")
         if (ctx.action(for: nil) != nil) {
             ctx.performAction(for: nil)
         } else if let url = ctx.optionsPageURL {
             openPage(url, title: name(ctx))
         }
+    }
+
+    func log(_ s: String) {
+        guard ProcessInfo.processInfo.environment["STICKY_DEBUG"] != nil else { return }
+        fputs("[ext] " + s + "\n", stderr)
     }
 
     // MARK: WKWebExtensionControllerDelegate
@@ -77,6 +154,7 @@ enum ExtensionsFolder {
                                 presentActionPopup action: WKWebExtension.Action,
                                 for context: WKWebExtensionContext,
                                 completionHandler: @escaping ((any Error)?) -> Void) {
+        log("presentActionPopup popover=\(action.popupPopover != nil) webView=\(action.popupWebView != nil) anchor=\(anchor != nil)")
         guard let popover = action.popupPopover else {
             completionHandler(nil)
             return
