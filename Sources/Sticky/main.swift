@@ -17,6 +17,7 @@ struct StickyConfig: Codable {
     var url: String?
     var frame: CGRect?
     var note: String?  // note file name in ~/Documents/Sticky Notes, or a full path
+    var zoom: Double?  // web page zoom
 }
 
 enum Store {
@@ -328,13 +329,32 @@ final class HoverView: NSView {
         w.uiDelegate = self
         w.isInspectable = true  // right-click → Inspect Element, for debugging
         w.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
+        w.allowsMagnification = true  // trackpad pinch
+        w.pageZoom = config.zoom ?? 1
         container.addSubview(w)
         web = w
+        panel.keyHandler = { [weak self] e in self?.handleWebKey(e) ?? false }
         if let u = URL(string: config.url ?? "") { w.load(URLRequest(url: u)) }
         panel.title = config.url ?? "Web"
         titleObserver = w.observe(\.title) { [weak self] w, _ in
             if let t = w.title, !t.isEmpty { self?.panel.title = t }
         }
+    }
+
+    /// ⌘= / ⌘- / ⌘0 (or whatever zoom keys are set) zoom the page. Other keys go to the page.
+    private func handleWebKey(_ e: NSEvent) -> Bool {
+        guard let w = web, let a = Keymap.shared.localAction(for: e) else { return false }
+        let steps: [CGFloat] = [0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3]
+        let now = w.pageZoom
+        switch a {
+        case .zoomIn: w.pageZoom = steps.first { $0 > now + 0.01 } ?? now
+        case .zoomOut: w.pageZoom = steps.last { $0 < now - 0.01 } ?? now
+        case .zoomReset: w.pageZoom = 1; w.magnification = 1
+        default: return false
+        }
+        config.zoom = Double(w.pageZoom)
+        app?.persist()
+        return true
     }
 
     func show() {
