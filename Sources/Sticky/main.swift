@@ -18,6 +18,7 @@ struct StickyConfig: Codable {
     var frame: CGRect?
     var note: String?  // note file name in ~/Documents/Sticky Notes, or a full path
     var zoom: Double?  // web page zoom
+    var hidden: Bool?  // hidden with the red button / ⌘W (still running)
 }
 
 enum Store {
@@ -89,8 +90,17 @@ final class HoverView: NSView {
     private var titleObserver: NSKeyValueObservation?
     private var popups: [NSPanel] = []
     private var note: NoteEditor?
+    private var urlObserver: NSKeyValueObservation?
+    private var visitHost: String?
+    private var visitNeedsTitle = false
+    /// Restored at launch: the first page load isn't a new visit for site ranking.
+    var skipFirstVisit = false
+    /// For the ⌃Tab switcher: most recently used first, plus a picture of the sticky.
+    var lastFocused = Date.distantPast
+    var thumbnail: NSImage?
+    private var thumbnailSoon: DispatchWorkItem?
 
-    init(config: StickyConfig, app: AppDelegate, cascade: Int) {
+    init(config: StickyConfig, app: AppDelegate, cascade: Int, restoring: Bool = false) {
         self.config = config
         self.app = app
         let start = CGRect(x: 160 + cascade * 30, y: 420 - cascade * 30, width: 560, height: 400)
@@ -124,6 +134,7 @@ final class HoverView: NSView {
             self?.updateAlpha()
         }
 
+        skipFirstVisit = restoring
         switch config.kind {
         case .terminal: setUpTerminal(in: container)
         case .web: setUpWeb(in: container)
@@ -138,6 +149,7 @@ final class HoverView: NSView {
         t.processDelegate = self
         container.addSubview(t)
         term = t
+        panel.keyHandler = { [weak self] e in self?.handleStickyKey(e) ?? false }
 
         var env = ProcessInfo.processInfo.environment
         env["TERM"] = "xterm-256color"
@@ -189,7 +201,7 @@ final class HoverView: NSView {
     }
 
     private func handleNoteKey(_ e: NSEvent) -> Bool {
-        guard let note, let action = Keymap.shared.localAction(for: e) else { return false }
+        guard let note, let action = Keymap.shared.localAction(for: e, in: .notes) else { return false }
         // Let Esc close the find bar instead of hiding the window.
         if action == .hideNotes, panel.firstResponder !== note.textView { return false }
         return perform(action)
@@ -235,7 +247,7 @@ final class HoverView: NSView {
         case .zoomOut: NotesState.shared.zoom -= 0.1
         case .zoomReset: NotesState.shared.zoom = 1
         case .find: note.showFind()
-        case .hideNotes, .toggleNotes, .newNoteGlobal, .toggleAll, .editKeybindings:
+        case .hideNotes, .toggleNotes, .newNoteGlobal, .toggleAll, .switchStickiesGlobal, .editKeybindings:
             app?.runGlobal(a)
         default: return false
         }
@@ -332,7 +344,7 @@ final class HoverView: NSView {
 
     private func showActions() {
         let skip: Set<Action> = [.actionPanel, .pinned2, .pinned3, .pinned4, .pinned5, .pinned6, .pinned7, .pinned8, .pinned9]
-        let items = Action.allCases.filter { !skip.contains($0) }.map { a in
+        let items = Action.allCases.filter { !skip.contains($0) && !$0.isStickyOnly }.map { a in
             QuickPicker.Item(title: a.title, detail: Keymap.shared.combos(a).map(\.display).joined(separator: "  ")) { [weak self] in
                 self?.perform(a)
             }
@@ -353,31 +365,168 @@ final class HoverView: NSView {
         w.pageZoom = config.zoom ?? 1
         container.addSubview(w)
         web = w
-        panel.keyHandler = { [weak self] e in self?.handleWebKey(e) ?? false }
+        panel.keyHandler = { [weak self] e in self?.handleStickyKey(e) ?? false }
         if let u = URL(string: config.url ?? "") { w.load(URLRequest(url: u)) }
         panel.title = config.url ?? "Web"
         titleObserver = w.observe(\.title) { [weak self] w, _ in
-            if let t = w.title, !t.isEmpty { self?.panel.title = t }
+            MainActor.assumeIsolated {
+                guard let self, let t = w.title, !t.isEmpty else { return }
+                self.panel.title = t
+                // A new page title means the page loaded: refresh the switcher picture soon.
+                self.thumbnailSoon?.cancel()
+                let job = DispatchWorkItem { [weak self] in
+                    if let self, self.panel.isVisible, self.panel.alphaValue > 0 { self.captureThumbnail() }
+                }
+                self.thumbnailSoon = job
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: job)
+                // The first page title of a visit names the site in the site list.
+                if self.visitNeedsTitle, let u = w.url {
+                    self.visitNeedsTitle = false
+                    Sites.shared.setTitle(t, for: u)
+                }
+            }
+        }
+        // A new site (not every page) counts as a visit, for ranking the site list.
+        urlObserver = w.observe(\.url) { [weak self] w, _ in
+            MainActor.assumeIsolated {
+                guard let self, let u = w.url, let host = Sites.key(for: u), host != self.visitHost else { return }
+                self.visitHost = host
+                if self.skipFirstVisit { self.skipFirstVisit = false; return }
+                Sites.shared.recordVisit(u, title: w.title ?? "")
+                self.visitNeedsTitle = true
+            }
         }
     }
 
-    /// ⌘= / ⌘- / ⌘0 (or whatever zoom keys are set) zoom the page. Other keys go to the page.
-    private func handleWebKey(_ e: NSEvent) -> Bool {
-        guard let w = web, let a = Keymap.shared.localAction(for: e) else { return false }
-        let steps: [CGFloat] = [0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3]
-        let now = w.pageZoom
+    var isWeb: Bool { web != nil }
+    var isTerminal: Bool { term != nil }
+    var currentURL: URL? { web?.url ?? URL(string: config.url ?? "") }
+
+    /// Name for the switcher and the menu bar list.
+    var displayTitle: String {
+        let t = panel.title.trimmingCharacters(in: .whitespaces)
+        if !t.isEmpty { return t }
+        return currentURL?.host ?? config.command ?? "Sticky"
+    }
+
+    func navigate(to url: URL) {
+        guard let w = web else { return }
+        w.load(URLRequest(url: url))
+        config.url = url.absoluteString
+        app?.persist()
+    }
+
+    /// Sticky keys (⌃Tab switcher, ⇧⌘W, ⌘T, ⌘L, ⌘D, zoom). Other keys go to the page or terminal.
+    private func handleStickyKey(_ e: NSEvent) -> Bool {
+        guard let a = Keymap.shared.localAction(for: e, in: .stickies) else { return false }
         switch a {
-        case .zoomIn: w.pageZoom = steps.first { $0 > now + 0.01 } ?? now
-        case .zoomOut: w.pageZoom = steps.last { $0 < now - 0.01 } ?? now
-        case .zoomReset: w.pageZoom = 1; w.magnification = 1
+        case .switchStickies: app?.switchStickies(back: false, holding: e.modifierFlags)
+        case .switchStickiesBack: app?.switchStickies(back: true, holding: e.modifierFlags)
+        case .closeSticky: app?.closeForGood(self)
+        case .newWebSticky: app?.showSiteLauncher(over: panel, into: nil)
+        case .openSiteHere:
+            guard isWeb else { return false }
+            app?.showSiteLauncher(over: panel, into: self)
+        case .saveSite:
+            guard let w = web, let u = w.url else { return false }
+            let saved = Sites.shared.toggleSaved(u, title: w.title ?? "")
+            flash(saved ? "Saved to your sites" : "Removed from your sites")
+        case .zoomIn, .zoomOut, .zoomReset:
+            guard let w = web else { return false }
+            let steps: [CGFloat] = [0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3]
+            let now = w.pageZoom
+            switch a {
+            case .zoomIn: w.pageZoom = steps.first { $0 > now + 0.01 } ?? now
+            case .zoomOut: w.pageZoom = steps.last { $0 < now - 0.01 } ?? now
+            default: w.pageZoom = 1; w.magnification = 1
+            }
+            config.zoom = Double(w.pageZoom)
+            app?.persist()
         default: return false
         }
-        config.zoom = Double(w.pageZoom)
-        app?.persist()
         return true
     }
 
+    /// A short message at the top of the sticky that fades out.
+    func flash(_ text: String) {
+        guard let container = panel.contentView else { return }
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 13, weight: .medium)
+        label.sizeToFit()
+        let pill = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: label.frame.width + 28, height: 30))
+        pill.material = .hudWindow
+        pill.state = .active
+        pill.wantsLayer = true
+        pill.layer?.cornerRadius = 15
+        label.frame.origin = NSPoint(x: 14, y: (30 - label.frame.height) / 2)
+        pill.addSubview(label)
+        pill.frame.origin = NSPoint(x: (container.bounds.width - pill.frame.width) / 2, y: container.bounds.height - 64)
+        pill.autoresizingMask = [.minXMargin, .maxXMargin, .minYMargin]
+        container.addSubview(pill)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            NSAnimationContext.runAnimationGroup({ $0.duration = 0.3; pill.animator().alphaValue = 0 },
+                                                 completionHandler: { pill.removeFromSuperview() })
+        }
+    }
+
+    /// Takes a small picture of the sticky for the ⌃Tab switcher.
+    func captureThumbnail(_ done: (() -> Void)? = nil) {
+        if let w = web {
+            let c = WKSnapshotConfiguration()
+            c.snapshotWidth = 320
+            w.takeSnapshot(with: c) { [weak self] img, _ in
+                MainActor.assumeIsolated {
+                    if let img { self?.thumbnail = img }
+                    done?()
+                }
+            }
+        } else if let v = term, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) {
+            v.cacheDisplay(in: v.bounds, to: rep)
+            let img = NSImage(size: v.bounds.size)
+            img.addRepresentation(rep)
+            thumbnail = img
+            done?()
+        } else {
+            done?()
+        }
+    }
+
+    /// Is a program (not just the shell prompt) running in this terminal?
+    var hasRunningProgram: Bool {
+        guard let t = term, t.process.running else { return false }
+        var pids = [pid_t](repeating: 0, count: 64)
+        let n = proc_listchildpids(t.process.shellPid, &pids, Int32(pids.count * MemoryLayout<pid_t>.size))
+        return n > 0
+    }
+
+    /// Hides the sticky. It keeps running, and ⌃Tab or the menu bar brings it back.
+    func hide() {
+        guard panel.isVisible else { return }
+        config.hidden = true
+        app?.persist()
+        if isWeb {
+            // Looks hidden right away, but stays on screen until the picture is taken:
+            // a web view that's off screen can't draw one.
+            panel.alphaValue = 0
+            panel.ignoresMouseEvents = true
+            var done = false
+            let finish = { [weak self] in
+                guard let self, !done else { return }
+                done = true
+                self.panel.orderOut(nil)
+                self.panel.ignoresMouseEvents = false
+            }
+            captureThumbnail(finish)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: finish)
+        } else {
+            captureThumbnail()
+            panel.orderOut(nil)
+        }
+    }
+
     func show() {
+        if config.hidden == true { config.hidden = nil; app?.persist() }
+        panel.ignoresMouseEvents = false
         panel.orderFrontRegardless()
         panel.makeKey()
         if let t = term { panel.makeFirstResponder(t) }
@@ -389,6 +538,7 @@ final class HoverView: NSView {
     func reload() { web?.reload() }
 
     private func updateAlpha() {
+        guard config.hidden != true else { return }  // mid-hide: stay invisible
         let solid = hovering || panel.isKeyWindow
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.2
@@ -443,10 +593,15 @@ final class HoverView: NSView {
     // NSWindowDelegate
     func windowDidBecomeKey(_ n: Notification) {
         updateAlpha()
-        if isNote { app?.noteBecameKey(self) }
+        if isNote { app?.noteBecameKey(self) } else { lastFocused = Date() }
     }
-    func windowDidResignKey(_ n: Notification) { updateAlpha() }
+    func windowDidResignKey(_ n: Notification) {
+        updateAlpha()
+        if !isNote, panel.isVisible { captureThumbnail() }
+    }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        // Red button / ⌘W only hides web and terminal stickies. ⇧⌘W closes them for good.
+        if !isNote { hide(); return false }
         guard app?.shouldHideInsteadOfClose(self) == true else { return true }
         note?.saveNow()
         panel.orderOut(nil)
@@ -473,7 +628,7 @@ final class HoverView: NSView {
 
 // MARK: - App
 
-@MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var stickies: [StickyController] = []
     private var hotKeyRefs: [EventHotKeyRef] = []
@@ -509,7 +664,7 @@ final class HoverView: NSView {
             }
             // Stickies come back where they were. The notes window stays hidden until ⌃⌘B,
             // like Raycast Notes.
-            for c in Store.load() { open(c, show: c.kind != .note) }
+            for c in Store.load() { open(c, show: c.kind != .note && c.hidden != true, restoring: true) }
             if stickies.isEmpty { newClaudeHere(folder: NSHomeDirectory() + "/Documents") }
             // Debug: STICKY_DEBUG_BROWSE=1 opens the ⌘P note switcher on launch.
             if ProcessInfo.processInfo.environment["STICKY_DEBUG_BROWSE"] != nil, let n = noteStickies.first {
@@ -532,6 +687,7 @@ final class HoverView: NSView {
         }
         let k = Keymap.shared
         let m = NSMenu()
+        m.delegate = self  // fills in the live list of stickies each time the menu opens
         // Notes and stickies are separate things: each has its own section and its own show/hide.
         m.addItem(.sectionHeader(title: "Notes"))
         add(m, "Show / Hide Notes   \(k.shortcut(.toggleNotes))", #selector(toggleNotes))
@@ -549,11 +705,11 @@ final class HoverView: NSView {
         }
         m.addItem(.separator())
         m.addItem(.sectionHeader(title: "Stickies"))
-        add(m, "Show / Hide Stickies   \(k.shortcut(.toggleAll))", #selector(toggleAll))
+        stickiesToggleItem = add(m, "Show / Hide Stickies   \(k.shortcut(.toggleAll))", #selector(toggleAll))
         add(m, "New Claude Code Sticky (web)", #selector(newClaudeCodeWeb))
         add(m, "New Claude CLI Sticky…", #selector(newClaude))
         add(m, "New Terminal Sticky…", #selector(newTerminal))
-        add(m, "New Web Sticky…", #selector(newWeb))
+        add(m, "New Web Sticky…   \(k.shortcut(.newWebSticky))", #selector(newWeb))
         if #available(macOS 15.4, *) {
             m.addItem(.separator())
             let host = ExtensionHost.shared
@@ -581,8 +737,89 @@ final class HoverView: NSView {
         statusItem.menu = m
     }
 
-    private func add(_ m: NSMenu, _ title: String, _ sel: Selector) {
-        m.addItem(withTitle: title, action: sel, keyEquivalent: "").target = self
+    @discardableResult
+    private func add(_ m: NSMenu, _ title: String, _ sel: Selector) -> NSMenuItem {
+        let item = m.addItem(withTitle: title, action: sel, keyEquivalent: "")
+        item.target = self
+        return item
+    }
+
+    // MARK: Managing web and terminal stickies
+
+    private weak var stickiesToggleItem: NSMenuItem?
+    private static let listTag = 9001
+
+    private var otherStickies: [StickyController] { stickies.filter { !$0.isNote } }
+
+    /// The menu bar list: one item per sticky, checked when it's showing. Hold ⌥ to close one.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.items.filter { $0.tag == Self.listTag }.forEach(menu.removeItem)
+        let list = otherStickies
+        guard !list.isEmpty, let anchor = stickiesToggleItem, var i = menu.items.firstIndex(of: anchor) else { return }
+        func put(_ item: NSMenuItem) { item.tag = Self.listTag; i += 1; menu.insertItem(item, at: i) }
+        for s in list {
+            let full = s.displayTitle
+            let name = full.count > 42 ? String(full.prefix(41)) + "…" : full
+            let item = NSMenuItem(title: name, action: #selector(menuToggleSticky(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = s
+            item.state = s.panel.isVisible ? .on : .off
+            item.image = NSImage(systemSymbolName: s.isWeb ? "globe" : "terminal", accessibilityDescription: nil)
+            put(item)
+            let close = NSMenuItem(title: "Close “\(name)” for Good", action: #selector(menuCloseSticky(_:)), keyEquivalent: "")
+            close.target = self
+            close.representedObject = s
+            close.keyEquivalentModifierMask = .option
+            close.isAlternate = true
+            close.image = NSImage(systemSymbolName: "xmark.circle", accessibilityDescription: nil)
+            put(close)
+        }
+        let hint = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        hint.attributedTitle = NSAttributedString(string: "Click to show or hide. Hold ⌥ to close one.", attributes: [
+            .font: NSFont.menuFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
+        hint.isEnabled = false
+        put(hint)
+        put(.separator())
+    }
+
+    @objc func menuToggleSticky(_ sender: NSMenuItem) {
+        guard let s = sender.representedObject as? StickyController else { return }
+        if s.panel.isVisible { s.hide() } else { s.show() }
+    }
+
+    @objc func menuCloseSticky(_ sender: NSMenuItem) {
+        guard let s = sender.representedObject as? StickyController else { return }
+        DispatchQueue.main.async { self.closeForGood(s) }  // after the menu closes
+    }
+
+    /// ⌃Tab / ⌥Tab: most recently used sticky first, hidden ones included.
+    func switchStickies(back: Bool, holding mods: NSEvent.ModifierFlags) {
+        let list = otherStickies.sorted { $0.lastFocused > $1.lastFocused }
+        StickySwitcher.shared.step(back: back, holding: mods, stickies: list)
+    }
+
+    /// ⇧⌘W, the switcher's W key, or ⌥ in the menu. Asks first if a program is still running.
+    func closeForGood(_ s: StickyController) {
+        if s.hasRunningProgram {
+            NSApp.activate(ignoringOtherApps: true)
+            let a = NSAlert()
+            a.messageText = "Close “\(s.displayTitle)”?"
+            a.informativeText = "A program is still running in it. Closing the sticky stops it. To keep it running, hide it instead (⌘W)."
+            a.addButton(withTitle: "Close")
+            a.addButton(withTitle: "Cancel")
+            guard a.runModal() == .alertFirstButtonReturn else { return }
+        }
+        s.panel.close()
+    }
+
+    /// ⌘T / menu: pick a saved or past site, or type a new one. ⌘L opens it in the same sticky.
+    func showSiteLauncher(over parent: NSWindow?, into target: StickyController?) {
+        let go: (URL) -> Void = { [weak self, weak target] url in
+            if let target { target.navigate(to: url) } else { self?.open(StickyConfig(kind: .web, url: url.absoluteString)) }
+        }
+        QuickPicker.shared.present(
+            placeholder: target == nil ? "Open a site in a new sticky…" : "Open a site in this sticky…",
+            items: [], over: parent, rank: { q in Sites.shared.pickerItems(for: q, open: go) })
     }
 
     // Hidden main menu so ⌘C / ⌘V / ⌘W / ⌘R work inside stickies.
@@ -649,6 +886,7 @@ final class HoverView: NSView {
         case .toggleNotes: toggleNotes()
         case .newNoteGlobal: newNote()
         case .toggleAll: toggleAll()
+        case .switchStickiesGlobal: switchStickies(back: false, holding: NSEvent.modifierFlags)
         case .hideNotes: hideNotes()
         case .editKeybindings: editKeybindings()
         default: break
@@ -783,20 +1021,17 @@ final class HoverView: NSView {
         open(StickyConfig(kind: .web, url: "https://claude.ai/code"))
     }
 
-    @objc func newWeb() {
-        guard var url = ask("Website", placeholder: "e.g. chatgpt.com", value: "https://"),
-              !url.isEmpty, url != "https://" else { return }
-        if !url.contains("://") { url = "https://" + url }
-        open(StickyConfig(kind: .web, url: url))
-    }
+    @objc func newWeb() { showSiteLauncher(over: nil, into: nil) }
 
     /// Shows or hides the terminal and web stickies. Never touches the notes window (that's ⌃⌘B).
     @objc func toggleAll() {
-        let others = stickies.filter { !$0.isNote }
+        let others = otherStickies
         if others.contains(where: { $0.panel.isVisible }) {
             others.forEach { $0.panel.orderOut(nil) }
         } else {
-            others.forEach { $0.show() }
+            // Ones you hid on their own stay hidden, unless that's all of them.
+            let wanted = others.filter { $0.config.hidden != true }
+            (wanted.isEmpty ? others : wanted).forEach { $0.show() }
         }
     }
 
@@ -838,8 +1073,9 @@ final class HoverView: NSView {
     }
 
     // Bookkeeping
-    func open(_ c: StickyConfig, show: Bool = true) {
-        let s = StickyController(config: c, app: self, cascade: stickies.count % 8)
+    func open(_ c: StickyConfig, show: Bool = true, restoring: Bool = false) {
+        let s = StickyController(config: c, app: self, cascade: stickies.count % 8, restoring: restoring)
+        if c.kind != .note { s.lastFocused = restoring ? Date.distantPast.addingTimeInterval(Double(stickies.count)) : Date() }
         stickies.append(s)
         if show { s.show() }
         persist()

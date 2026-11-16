@@ -4,7 +4,9 @@ import Carbon
 
 enum Action: String, CaseIterable {
     // Global (work from any app)
-    case toggleNotes, newNoteGlobal, toggleAll
+    case toggleNotes, newNoteGlobal, toggleAll, switchStickiesGlobal
+    // Web and terminal stickies
+    case switchStickies, switchStickiesBack, closeSticky, newWebSticky, openSiteHere, saveSite
     // Notes window
     case newNote, browseNotes, actionPanel, togglePin, deleteNote, duplicateNote, copyNote
     case revealNote, openInNewSticky, back, forward, nextRecent, prevRecent
@@ -15,7 +17,16 @@ enum Action: String, CaseIterable {
     case heading1, heading2, heading3, codeBlock, quote, orderedList, bulletList, taskList, toggleTask
     case moveLineUp, moveLineDown
 
-    var isGlobal: Bool { [.toggleNotes, .newNoteGlobal, .toggleAll].contains(self) }
+    var isGlobal: Bool { [.toggleNotes, .newNoteGlobal, .toggleAll, .switchStickiesGlobal].contains(self) }
+
+    /// Keys that only work in web and terminal stickies.
+    var isStickyOnly: Bool {
+        [.switchStickies, .switchStickiesBack, .closeSticky, .newWebSticky, .openSiteHere, .saveSite].contains(self)
+    }
+
+    /// Zoom works in both notes and web stickies.
+    var worksInStickies: Bool { isStickyOnly || [.zoomIn, .zoomOut, .zoomReset].contains(self) }
+    var worksInNotes: Bool { !isGlobal && !isStickyOnly }
 
     var pinIndex: Int? {
         let all: [Action] = [.pinned1, .pinned2, .pinned3, .pinned4, .pinned5, .pinned6, .pinned7, .pinned8, .pinned9]
@@ -27,6 +38,13 @@ enum Action: String, CaseIterable {
         case .toggleNotes: return "Show / Hide Notes"
         case .newNoteGlobal: return "New Note (from anywhere)"
         case .toggleAll: return "Show / Hide Stickies (not notes)"
+        case .switchStickiesGlobal: return "Switch Stickies (from anywhere)"
+        case .switchStickies: return "Switch Stickies"
+        case .switchStickiesBack: return "Switch Stickies Backward"
+        case .closeSticky: return "Close Sticky for Good"
+        case .newWebSticky: return "New Web Sticky"
+        case .openSiteHere: return "Open a Site in This Sticky"
+        case .saveSite: return "Save / Unsave This Site"
         case .newNote: return "New Note"
         case .browseNotes: return "Browse Notes"
         case .actionPanel: return "Show Actions"
@@ -72,6 +90,13 @@ enum Action: String, CaseIterable {
         case .toggleNotes: return ["ctrl+cmd+b"]
         case .newNoteGlobal: return ["ctrl+opt+n"]
         case .toggleAll: return ["ctrl+opt+space"]
+        case .switchStickiesGlobal: return ["opt+tab"]
+        case .switchStickies: return ["ctrl+tab"]
+        case .switchStickiesBack: return ["ctrl+shift+tab"]
+        case .closeSticky: return ["cmd+shift+w"]
+        case .newWebSticky: return ["cmd+t"]
+        case .openSiteHere: return ["cmd+l"]
+        case .saveSite: return ["cmd+d"]
         case .newNote: return ["cmd+n"]
         case .browseNotes: return ["cmd+p"]
         case .actionPanel: return ["cmd+k"]
@@ -207,6 +232,7 @@ struct KeyCombo: Hashable {
 
     private init() {
         writeDefaultsIfMissing()
+        addMissingKeys()
         load()
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
             MainActor.assumeIsolated { Keymap.shared.reloadIfChanged() }
@@ -217,10 +243,15 @@ struct KeyCombo: Hashable {
 
     func shortcut(_ a: Action) -> String { combos(a).first?.display ?? "" }
 
-    /// The in-window action bound to this key press, if any.
-    func localAction(for event: NSEvent) -> Action? {
+    enum Scope { case notes, stickies }
+
+    /// The in-window action bound to this key press, if any. Notes and stickies have separate keys,
+    /// so ⌃Tab can cycle notes in the notes window and switch stickies in a sticky.
+    func localAction(for event: NSEvent, in scope: Scope) -> Action? {
         let combo = KeyCombo(event: event)
-        return Action.allCases.first { !$0.isGlobal && combos($0).contains(combo) }
+        return Action.allCases.first { a in
+            (scope == .notes ? a.worksInNotes : a.worksInStickies) && combos(a).contains(combo)
+        }
     }
 
     private func modified() -> Date? {
@@ -253,6 +284,25 @@ struct KeyCombo: Hashable {
             }
         }
         bindings = out
+    }
+
+    /// After an update adds new shortcuts, list them in the user's file too (keeps their edits).
+    private func addMissingKeys() {
+        guard let text = try? String(contentsOf: Self.file, encoding: .utf8),
+              let data = text.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let end = text.range(of: "}", options: .backwards) else { return }
+        let missing = Action.allCases.filter { obj[$0.rawValue] == nil }
+        guard !missing.isEmpty else { return }
+        func q(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\\", with: "\\\\") + "\"" }
+        let lines = missing.map { a -> String in
+            let v = a.defaultKeys
+            return "  \(q(a.rawValue)): " + (v.count == 1 ? q(v[0]) : "[" + v.map(q).joined(separator: ", ") + "]")
+        }
+        var head = String(text[..<end.lowerBound])
+        while head.last?.isWhitespace == true { head.removeLast() }
+        let joiner = head.hasSuffix("{") ? "\n" : ",\n"
+        try? (head + joiner + lines.joined(separator: ",\n") + "\n}\n").write(to: Self.file, atomically: true, encoding: .utf8)
     }
 
     private func writeDefaultsIfMissing() {

@@ -8,12 +8,30 @@ Floating, always-on-top windows for macOS. Each sticky runs a terminal command o
 - **Claude CLI sticky** — runs `claude` in a folder you pick.
 - **Terminal sticky** — runs any command (`python3`, `htop`, `npm run dev`, …). When it exits you get a normal shell.
 - **Web sticky** — any website. Sign-ins are saved. ⌘- / ⌘= / ⌘0 zoom the page (or pinch), and each sticky remembers its zoom.
+- **Sticky switcher** — hold **⌃** and press **Tab** in any sticky (or **⌥Tab** from any app) to see all your web and terminal stickies with a picture of each, hidden ones too. Let go to switch, like ⌘Tab. A quick tap jumps back to the last one.
+- **Hide, don't close** — the red button and ⌘W hide a sticky. It keeps running (the terminal keeps its program, the page stays loaded) and comes back from the switcher or the menu bar. **⇧⌘W** closes it for good, and asks first if a program is still running.
+- **Saved sites** — ⌘T (or menu bar → **New Web Sticky…**) opens a list of your saved sites and the sites you've opened before, so you don't retype addresses. ⌘D saves the page you're on. The list is ranked by relevance, not just recency: what you typed, how often and how lately you open a site, and what you picked before for the same text.
 - **Notes** — works like Raycast Notes. **⌃⌘B** shows or hides the notes window, which shows one note at a time. Markdown formats as you type: headings, **bold**, *italic*, underline, ~~strike~~, `code`, code blocks, quotes, links, and clickable `- [ ]` checklists. Return starts a new paragraph (or list item), Shift+Return adds a line break in the same paragraph, Tab indents lists. Notes autosave as plain `.md` files in `~/Documents/Sticky Notes`.
 - Fades to 40% when the mouse leaves and the window isn't focused.
 - Notes and stickies stay separate. **⌃⌘B** only shows or hides the notes window, and **⌃⌥Space** only shows or hides the terminal and web stickies. Neither shortcut touches the other (no Accessibility permission needed).
 - Remembers each sticky's position and reopens them on launch. The notes window stays hidden at launch until you press ⌃⌘B, and closing it only hides it, so it comes back in the same spot.
 - Optional **Open at Login** toggle in the menu.
 - Lives in the menu bar, no Dock icon.
+
+## Sticky shortcuts
+
+These work in web and terminal stickies. All of them can be changed (see **Keybindings** below).
+
+| Action | Keys | Action | Keys |
+|---|---|---|---|
+| Sticky switcher | ⌃⇥ (in a sticky) / ⌥⇥ (anywhere) | Show / hide all stickies (global) | ⌃⌥Space |
+| Hide sticky | ⌘W or the red button | Close sticky for good | ⇧⌘W |
+| New web sticky (site list) | ⌘T | Open a site in this sticky | ⌘L |
+| Save / unsave this site | ⌘D | Zoom in / out / reset | ⌘= / ⌘- / ⌘0 |
+
+In the switcher: Tab or arrows move, let go of ⌃ (or press Return) to switch, **H** hides the highlighted sticky, **W** closes it for good, Esc cancels. The menu bar also lists every sticky: click one to show or hide it, or hold ⌥ to close it.
+
+Saved sites live in `~/.config/sticky/sites.json`, so you can edit or reorder them by hand. If nothing matches what you type, Return opens it as an address (one word becomes `word.com`) or searches the web.
 
 ## Note shortcuts
 

@@ -19,6 +19,10 @@ import AppKit
     private var all: [Item] = []
     private var shown: [Item] = []
     private var extra: ((String) -> Item?)?
+    private var rank: ((String) -> [Item])?  // custom ranking (the site list), instead of the built-in filter
+
+    /// What's typed right now.
+    var query: String { field.stringValue.trimmingCharacters(in: .whitespaces) }
     private weak var returnTo: NSWindow?
 
     private override init() {
@@ -84,9 +88,11 @@ import AppKit
         bg.addSubview(scroll)
     }
 
-    func present(placeholder: String, items: [Item], over parent: NSWindow?, extra: ((String) -> Item?)? = nil) {
+    func present(placeholder: String, items: [Item], over parent: NSWindow?, extra: ((String) -> Item?)? = nil,
+                 rank: ((String) -> [Item])? = nil) {
         all = items
         self.extra = extra
+        self.rank = rank
         returnTo = parent
         field.placeholderString = placeholder
         field.stringValue = ""
@@ -125,7 +131,9 @@ import AppKit
 
     private func refilter() {
         let q = field.stringValue.trimmingCharacters(in: .whitespaces).lowercased()
-        if q.isEmpty {
+        if let rank {
+            shown = rank(query)
+        } else if q.isEmpty {
             shown = all
         } else {
             let tokens = q.split(separator: " ").map(String.init)
