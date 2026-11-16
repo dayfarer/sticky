@@ -53,7 +53,7 @@ enum Action: String, CaseIterable {
         case .duplicateNote: return "Duplicate Note"
         case .copyNote: return "Copy Note as Markdown"
         case .revealNote: return "Show Note in Finder"
-        case .openInNewSticky: return "Open Note in New Window"
+        case .openInNewSticky: return "Pop Out Note as a Sticky"
         case .back: return "Back"
         case .forward: return "Forward"
         case .nextRecent: return "Next Recent Note"

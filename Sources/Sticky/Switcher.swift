@@ -135,7 +135,7 @@ import AppKit
         for (i, t) in tiles.enumerated() where i < list.count {
             let s = list[i]
             let state = !s.panel.isVisible ? "hidden" : (s === current ? "current" : "showing")
-            t.set(title: s.displayTitle, symbol: s.isWeb ? "globe" : "terminal", state: state,
+            t.set(title: s.displayTitle, symbol: s.symbolName, state: state,
                   image: s.thumbnail, selected: i == sel)
         }
     }

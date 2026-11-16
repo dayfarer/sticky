@@ -551,6 +551,14 @@ final class MarkdownTextView: NSTextView {
                 self.reloadFromDisk()
             }
         }
+        // The same note open in another editor here (say, the notes window and a note sticky): show its saves.
+        NotificationCenter.default.addObserver(forName: .stickyNoteSaved, object: nil, queue: .main) { [weak self] n in
+            MainActor.assumeIsolated {
+                guard let self, let id = n.object as? String, id == self.noteID,
+                      n.userInfo?["editor"] as? ObjectIdentifier != ObjectIdentifier(self) else { return }
+                self.reloadFromDisk()
+            }
+        }
         Self.registry.add(self)
         load(noteID)
     }
@@ -603,7 +611,7 @@ final class MarkdownTextView: NSTextView {
         guard dirty else { return }
         dirty = false
         try? LineBreaks.toFile(textView.string).write(to: fileURL, atomically: true, encoding: .utf8)
-        NotificationCenter.default.post(name: .stickyNoteSaved, object: noteID)
+        NotificationCenter.default.post(name: .stickyNoteSaved, object: noteID, userInfo: ["editor": ObjectIdentifier(self)])
     }
 
     /// Forget unsaved changes (used before deleting a note).

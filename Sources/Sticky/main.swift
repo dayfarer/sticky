@@ -19,6 +19,7 @@ struct StickyConfig: Codable {
     var note: String?  // note file name in ~/Documents/Sticky Notes, or a full path
     var zoom: Double?  // web page zoom
     var hidden: Bool?  // hidden with the red button / ⌘W (still running)
+    var noteSticky: Bool?  // a note shown as a sticky (⌃Tab, ⌘W hides it), not part of the notes window
 }
 
 enum Store {
@@ -111,7 +112,7 @@ final class HoverView: NSView {
         if let saved = config.frame {
             panel.setFrame(saved, display: false)
         } else if config.kind == .note {
-            panel.setContentSize(NSSize(width: 380, height: 440))
+            panel.setContentSize(config.noteSticky == true ? NSSize(width: 320, height: 340) : NSSize(width: 380, height: 440))
         }
 
         panel.level = .floating
@@ -192,6 +193,11 @@ final class HoverView: NSView {
     // MARK: Note commands
 
     var isNote: Bool { note != nil }
+    /// A note shown as a sticky: it joins ⌃Tab, the menu list and ⌃⌥Space, not ⌃⌘B.
+    var isNoteSticky: Bool { isNote && config.noteSticky == true }
+    /// The notes window (⌃⌘B), as opposed to stickies.
+    var inNotesGroup: Bool { isNote && config.noteSticky != true }
+    var symbolName: String { isWeb ? "globe" : isNote ? "note.text" : "terminal" }
     private var history: [String] = []
     private var historyIndex = 0
 
@@ -201,9 +207,18 @@ final class HoverView: NSView {
     }
 
     private func handleNoteKey(_ e: NSEvent) -> Bool {
-        guard let note, let action = Keymap.shared.localAction(for: e, in: .notes) else { return false }
-        // Let Esc close the find bar instead of hiding the window.
-        if action == .hideNotes, panel.firstResponder !== note.textView { return false }
+        guard let note else { return false }
+        // A note sticky is a sticky too: ⌃Tab switches stickies, ⇧⌘W closes it, ⌘T opens a site.
+        if isNoteSticky, let a = Keymap.shared.localAction(for: e, in: .stickies),
+           [.switchStickies, .switchStickiesBack, .closeSticky, .newWebSticky].contains(a) {
+            return handleStickyKey(e)
+        }
+        guard let action = Keymap.shared.localAction(for: e, in: .notes) else { return false }
+        if action == .hideNotes {
+            if isNoteSticky { return false }  // Esc doesn't hide a note sticky (⌘W does)
+            // Let Esc close the find bar instead of hiding the window.
+            if panel.firstResponder !== note.textView { return false }
+        }
         return perform(action)
     }
 
@@ -232,7 +247,7 @@ final class HoverView: NSView {
             NSWorkspace.shared.activateFileViewerSelecting([note.fileURL])
         case .openInNewSticky:
             note.saveNow()
-            app?.open(StickyConfig(kind: .note, note: note.noteID))
+            app?.popOutNote(note.noteID, from: panel)
         case .back:
             guard historyIndex > 0 else { return true }
             historyIndex -= 1
@@ -485,7 +500,7 @@ final class HoverView: NSView {
                     done?()
                 }
             }
-        } else if let v = term, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) {
+        } else if let v = term ?? panel.contentView, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) {
             v.cacheDisplay(in: v.bounds, to: rep)
             let img = NSImage(size: v.bounds.size)
             img.addRepresentation(rep)
@@ -517,6 +532,7 @@ final class HoverView: NSView {
     /// Hides the sticky. It keeps running, and ⌃Tab or the menu bar brings it back.
     func hide() {
         guard panel.isVisible else { return }
+        note?.saveNow()
         config.hidden = true
         app?.persist()
         if isWeb {
@@ -608,15 +624,15 @@ final class HoverView: NSView {
     // NSWindowDelegate
     func windowDidBecomeKey(_ n: Notification) {
         updateAlpha()
-        if isNote { app?.noteBecameKey(self) } else { lastFocused = Date() }
+        if inNotesGroup { app?.noteBecameKey(self) } else { lastFocused = Date() }
     }
     func windowDidResignKey(_ n: Notification) {
         updateAlpha()
-        if !isNote, panel.isVisible { captureThumbnail() }
+        if !inNotesGroup, panel.isVisible { captureThumbnail() }
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        // Red button / ⌘W only hides web and terminal stickies. ⇧⌘W closes them for good.
-        if !isNote { hide(); return false }
+        // Red button / ⌘W only hides stickies (web, terminal, note stickies). ⇧⌘W closes them for good.
+        if !inNotesGroup { hide(); return false }
         guard app?.shouldHideInsteadOfClose(self) == true else { return true }
         note?.saveNow()
         panel.orderOut(nil)
@@ -679,7 +695,9 @@ final class HoverView: NSView {
             }
             // Stickies come back where they were. The notes window stays hidden until ⌃⌘B,
             // like Raycast Notes.
-            for c in Store.load() { open(c, show: c.kind != .note && c.hidden != true, restoring: true) }
+            for c in Store.load() {
+                open(c, show: (c.kind != .note || c.noteSticky == true) && c.hidden != true, restoring: true)
+            }
             if stickies.isEmpty { newClaudeHere(folder: NSHomeDirectory() + "/Documents") }
             // Debug: STICKY_DEBUG_BROWSE=1 opens the ⌘P note switcher on launch.
             if ProcessInfo.processInfo.environment["STICKY_DEBUG_BROWSE"] != nil, let n = noteStickies.first {
@@ -725,6 +743,7 @@ final class HoverView: NSView {
         add(m, "New Claude CLI Sticky…", #selector(newClaude))
         add(m, "New Terminal Sticky…", #selector(newTerminal))
         add(m, "New Web Sticky…   \(k.shortcut(.newWebSticky))", #selector(newWeb))
+        add(m, "New Note Sticky", #selector(newNoteSticky))
         if #available(macOS 15.4, *) {
             m.addItem(.separator())
             let host = ExtensionHost.shared
@@ -764,7 +783,8 @@ final class HoverView: NSView {
     private weak var stickiesToggleItem: NSMenuItem?
     private static let listTag = 9001
 
-    private var otherStickies: [StickyController] { stickies.filter { !$0.isNote } }
+    /// Web, terminal and note stickies: everything except the notes window.
+    private var otherStickies: [StickyController] { stickies.filter { !$0.inNotesGroup } }
 
     /// The menu bar list: one item per sticky, checked when it's showing. Hold ⌥ to close one.
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -779,7 +799,7 @@ final class HoverView: NSView {
             item.target = self
             item.representedObject = s
             item.state = s.panel.isVisible ? .on : .off
-            item.image = NSImage(systemSymbolName: s.isWeb ? "globe" : "terminal", accessibilityDescription: nil)
+            item.image = NSImage(systemSymbolName: s.symbolName, accessibilityDescription: nil)
             put(item)
             let close = NSMenuItem(title: "Close “\(name)” for Good", action: #selector(menuCloseSticky(_:)), keyEquivalent: "")
             close.target = self
@@ -908,7 +928,7 @@ final class HoverView: NSView {
         }
     }
 
-    private var noteStickies: [StickyController] { stickies.filter(\.isNote) }
+    private var noteStickies: [StickyController] { stickies.filter(\.inNotesGroup) }
     private weak var lastNote: StickyController?
 
     /// Like Raycast Notes: one hotkey shows the notes window, or hides it if it's in front.
@@ -1038,6 +1058,23 @@ final class HoverView: NSView {
 
     @objc func newWeb() { showSiteLauncher(over: nil, into: nil) }
 
+    /// A new, empty note as a sticky. ⌘P inside it switches to any other note.
+    @objc func newNoteSticky() { open(StickyConfig(kind: .note, noteSticky: true)) }
+
+    /// ⇧⌘N in a note: shows that note as its own sticky, next to the window you're in.
+    func popOutNote(_ id: String, from window: NSWindow) {
+        var c = StickyConfig(kind: .note, note: id, noteSticky: true)
+        let size = NSSize(width: 320, height: 340)
+        var origin = NSPoint(x: window.frame.maxX + 12, y: window.frame.maxY - size.height)
+        if let f = window.screen?.visibleFrame {
+            if origin.x + size.width > f.maxX { origin.x = window.frame.minX - size.width - 12 }
+            origin.x = min(max(origin.x, f.minX), f.maxX - size.width)
+            origin.y = min(max(origin.y, f.minY), f.maxY - size.height)
+        }
+        c.frame = CGRect(origin: origin, size: size)
+        open(c)
+    }
+
     /// Shows or hides the terminal and web stickies. Never touches the notes window (that's ⌃⌘B).
     @objc func toggleAll() {
         let others = otherStickies
@@ -1053,7 +1090,7 @@ final class HoverView: NSView {
     /// Closing the last notes window only hides it, so ⌃⌘B brings it back in the same spot.
     func shouldHideInsteadOfClose(_ s: StickyController) -> Bool {
         // Only for notes from the notes folder (not, say, the keybindings file).
-        let isLibraryNote = { (c: StickyController) in c.isNote && !(c.config.note ?? "").hasPrefix("/") }
+        let isLibraryNote = { (c: StickyController) in c.inNotesGroup && !(c.config.note ?? "").hasPrefix("/") }
         return isLibraryNote(s) && stickies.filter(isLibraryNote).count == 1
     }
 

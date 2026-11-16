@@ -9,6 +9,7 @@ Floating, always-on-top windows for macOS. Each sticky runs a terminal command o
 - **Terminal sticky** — runs any command (`python3`, `htop`, `npm run dev`, …). When it exits you get a normal shell.
 - **Web sticky** — any website. Sign-ins are saved. ⌘- / ⌘= / ⌘0 zoom the page (or pinch), and each sticky remembers its zoom.
 - **Sticky switcher** — hold **⌃** and press **Tab** in any sticky (or **⌥Tab** from any app) to see all your web and terminal stickies with a picture of each, hidden ones too. **Let go** and the one you picked swaps into the current sticky's spot (the current one hides), like tabs in one window. **Return** opens it as its own window instead. A quick tap swaps back to the last one.
+- **Note stickies** — press **⇧⌘N** in a note (or menu bar → **New Note Sticky**) to keep that note out as its own small sticky, like a to-do list next to Claude Code. It's the same editor with the same shortcuts, and it joins ⌃Tab, the menu bar list and ⌃⌥Space like any sticky. The notes window (⌃⌘B) stays separate. If a note is open in both, edits show up in the other right away.
 - **Hide, don't close** — the red button and ⌘W hide a sticky. It keeps running (the terminal keeps its program, the page stays loaded) and comes back from the switcher or the menu bar. **⇧⌘W** closes it for good, and asks first if a program is still running.
 - **Saved sites** — ⌘T (or menu bar → **New Web Sticky…**) opens a list of your saved sites and the sites you've opened before, so you don't retype addresses. ⌘D saves the page you're on. The list is ranked by relevance, not just recency: what you typed, how often and how lately you open a site, and what you picked before for the same text. A site counts as a visit once you've stayed 3 seconds, so sign-in pages you pass through don't clutter it.
 - **Notes** — works like Raycast Notes. **⌃⌘B** shows or hides the notes window, which shows one note at a time. Markdown formats as you type: headings, **bold**, *italic*, underline, ~~strike~~, `code`, code blocks, quotes, links, and clickable `- [ ]` checklists. Return starts a new paragraph (or list item), Shift+Return adds a line break in the same paragraph, Tab indents lists. Notes autosave as plain `.md` files in `~/Documents/Sticky Notes`.
@@ -20,7 +21,7 @@ Floating, always-on-top windows for macOS. Each sticky runs a terminal command o
 
 ## Sticky shortcuts
 
-These work in web and terminal stickies. All of them can be changed (see **Keybindings** below).
+These work in web, terminal and note stickies (in a note sticky, ⌃Tab switches stickies; use ⌘P to switch notes). All of them can be changed (see **Keybindings** below).
 
 | Action | Keys | Action | Keys |
 |---|---|---|---|
@@ -45,7 +46,7 @@ All of these can be changed (see **Keybindings** below).
 | Open pinned note 1–9 | ⌘1–⌘9 | Next / previous recent note | ⌃⇥ / ⌃⇧⇥ |
 | Back / forward | ⌘[ / ⌘] | Find in note | ⌘F |
 | Zoom in / out / reset | ⌘= / ⌘- / ⌘0 | Hide notes window | Esc |
-| Copy note as Markdown | ⇧⌘C | Open note in new window | ⇧⌘N |
+| Copy note as Markdown | ⇧⌘C | Pop out note as a sticky | ⇧⌘N |
 | Bold / italic / underline | ⌘B / ⌘I / ⌘U | Strikethrough | ⇧⌘S |
 | Inline code / link | ⌘E / ⌘L | Code block | ⌥⌘C |
 | Heading 1 / 2 / 3 | ⌥⌘1 / 2 / 3 | Blockquote | ⇧⌘B |
