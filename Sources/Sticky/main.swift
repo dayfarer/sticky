@@ -782,6 +782,7 @@ final class HoverView: NSView {
         add(m, "New Note   \(k.shortcut(.newNoteGlobal))", #selector(newNote))
         add(m, "Open Note File…", #selector(openNote))
         add(m, "Open Notes Folder", #selector(revealNotes))
+        add(m, "Math Formatting", #selector(toggleMath)).state = NotesState.shared.mathFormatting ? .on : .off
         if SyncEngine.shared.isConfigured {
             let status = NSMenuItem(title: SyncEngine.shared.statusText, action: nil, keyEquivalent: "")
             status.isEnabled = false
@@ -1186,6 +1187,12 @@ final class HoverView: NSView {
     @objc func revealExtensions() { NSWorkspace.shared.open(ExtensionsFolder.url) }
 
     @objc func revealNotes() { NSWorkspace.shared.open(NotesFolder.url) }
+
+    /// x^2, sqrt(x), pi, <= … shown as math in notes. Display only; the files keep what you typed.
+    @objc func toggleMath(_ sender: NSMenuItem) {
+        NotesState.shared.mathFormatting.toggle()
+        sender.state = NotesState.shared.mathFormatting ? .on : .off
+    }
 
     @objc func newClaudeCodeWeb() {
         open(StickyConfig(kind: .web, url: "https://claude.ai/code"))

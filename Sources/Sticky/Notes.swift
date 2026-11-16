@@ -79,13 +79,14 @@ enum NotesLibrary {
     }
 }
 
-/// Pinned notes and zoom, saved in Application Support.
+/// Pinned notes, zoom and math formatting, saved in Application Support.
 @MainActor final class NotesState {
     static let shared = NotesState()
 
     private struct Saved: Codable {
         var pinned: [String] = []
         var zoom: Double = 1
+        var math: Bool?  // math formatting; missing means on
     }
 
     private static let file = Store.file.deletingLastPathComponent().appendingPathComponent("notes-state.json")
@@ -94,6 +95,7 @@ enum NotesLibrary {
     private init() {
         if let d = try? Data(contentsOf: Self.file), let s = try? JSONDecoder().decode(Saved.self, from: d) { saved = s }
         Markdown.scale = CGFloat(saved.zoom)
+        MathStyle.enabled = saved.math ?? true
     }
 
     private func save() {
@@ -119,6 +121,17 @@ enum NotesLibrary {
         set {
             saved.zoom = Double(min(max(newValue, 0.6), 2.5))
             Markdown.scale = CGFloat(saved.zoom)
+            save()
+            NotificationCenter.default.post(name: .stickyRestyleNotes, object: nil)
+        }
+    }
+
+    /// Live math (x^2, sqrt(x), …). Menu bar → Math Formatting.
+    var mathFormatting: Bool {
+        get { saved.math ?? true }
+        set {
+            saved.math = newValue
+            MathStyle.enabled = newValue
             save()
             NotificationCenter.default.post(name: .stickyRestyleNotes, object: nil)
         }
@@ -149,9 +162,12 @@ enum Markdown {
     static let task      = rx(#"^([ \t]*[-*+][ \t])\[([ xX])\][ \t]?(.*)$"#)
     static let link      = rx(#"\[([^\]\n]+)\]\(([^)\s]+)\)"#)
     static let rule      = rx(#"^([-*_])\1{2,}[ \t]*$"#)
+    static let url       = rx(#"\bhttps?://\S+"#)
 
     /// Restyles the whole note. Notes are small, so this is fast enough per keystroke.
-    static func style(_ ts: NSTextStorage) {
+    /// Math that touches `caret` shows as typed. Returns the math ranges (see MathStyle).
+    @discardableResult
+    static func style(_ ts: NSTextStorage, caret: Int? = nil) -> (all: [NSRange], revealed: [NSRange]) {
         let str = ts.string
         let full = NSRange(location: 0, length: (str as NSString).length)
         let para = NSMutableParagraphStyle()
@@ -230,8 +246,10 @@ enum Markdown {
                                   .foregroundColor: NSColor.secondaryLabelColor], range: m.range(at: 3))
             }
         }
+        var addresses: [NSRange] = []  // no math in link targets or web addresses
         each(link) { m in
             guard !inCode(m.range) else { return }
+            addresses.append(m.range(at: 2))
             ts.addAttribute(.foregroundColor, value: dim, range: m.range)
             ts.addAttribute(.foregroundColor, value: NSColor.linkColor, range: m.range(at: 1))
             let target = (str as NSString).substring(with: m.range(at: 2))
@@ -241,6 +259,8 @@ enum Markdown {
             guard !inCode(m.range) else { return }
             ts.addAttribute(.foregroundColor, value: dim, range: m.range)
         }
+        each(url) { m in addresses.append(m.range) }
+        return MathStyle.style(ts, skip: codeRanges + addresses, caret: caret)
     }
 
     private static func addTrait(_ ts: NSTextStorage, _ r: NSRange, _ t: NSFontTraitMask) {
@@ -259,6 +279,20 @@ final class MarkdownTextView: NSTextView {
     private static let prefix = try! NSRegularExpression(
         pattern: #"^([ \t]*)([-*+] \[[ xX]\] ?|[-*+] |\d+[.)] |> ?)?(.*)$"#)
     private static let headingPrefix = try! NSRegularExpression(pattern: #"^(#{1,6})[ \t]+"#)
+
+    /// The text view owns its TextKit 1 stack (made in init(mathFrame:)).
+    private var ownedStorage: NSTextStorage?
+
+    /// TextKit 1 with MathLayoutManager, so math can hide markers, swap symbols and draw √.
+    convenience init(mathFrame frame: NSRect) {
+        let storage = NSTextStorage()
+        let layout = MathLayoutManager()
+        storage.addLayoutManager(layout)
+        let container = NSTextContainer(size: NSSize(width: frame.width, height: .greatestFiniteMagnitude))
+        layout.addTextContainer(container)
+        self.init(frame: frame, textContainer: container)
+        ownedStorage = storage
+    }
 
     /// Copy with normal newlines, so pasting elsewhere looks right.
     override func copy(_ sender: Any?) {
@@ -500,6 +534,8 @@ final class MarkdownTextView: NSTextView {
     private var pendingSave: DispatchWorkItem?
     private var dirty = false
     private var loading = false
+    private var mathRanges: [NSRange] = []  // from the last restyle
+    private var revealed: [NSRange] = []    // math shown as typed because the cursor touches it
 
     private static let listPrefix = try! NSRegularExpression(
         pattern: #"^([ \t]*)([-*+] \[[ xX]\] |[-*+] |(\d+)([.)]) |> )"#)
@@ -519,7 +555,8 @@ final class MarkdownTextView: NSTextView {
         scroll.drawsBackground = false
 
         let size = scroll.contentSize
-        textView = MarkdownTextView(frame: NSRect(origin: .zero, size: size))
+        _ = NotesState.shared  // zoom and math settings, before the first restyle
+        textView = MarkdownTextView(mathFrame: NSRect(origin: .zero, size: size))
         textView.minSize = NSSize(width: 0, height: size.height)
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: .greatestFiniteMagnitude)
         textView.isVerticallyResizable = true
@@ -601,9 +638,29 @@ final class MarkdownTextView: NSTextView {
     }
 
     func restyle() {
-        if let ts = textView.textStorage { Markdown.style(ts) }
+        guard let ts = textView.textStorage else { return }
+        ts.beginEditing()
+        let math = Markdown.style(ts, caret: caret)
+        ts.endEditing()
+        (mathRanges, revealed) = (math.all, math.revealed)
         textView.typingAttributes[.font] = Markdown.base
     }
+
+    /// The cursor, or nil when text is selected.
+    private var caret: Int? {
+        let s = textView.selectedRange()
+        return s.length == 0 ? s.location : nil
+    }
+
+    /// Math the cursor moves onto shows as typed; math it leaves formats again.
+    private func updateReveal() {
+        guard MathStyle.enabled, let ts = textView.textStorage, ts.editedMask.isEmpty else { return }
+        let c = caret
+        let want = mathRanges.filter { r in c.map { $0 >= r.location && $0 <= NSMaxRange(r) } ?? false }
+        if want != revealed { restyle() }
+    }
+
+    func textViewDidChangeSelection(_ n: Notification) { updateReveal() }
 
     /// Writes the note if it has unsaved changes.
     func saveNow() {
@@ -630,11 +687,14 @@ final class MarkdownTextView: NSTextView {
     func textStorage(_ ts: NSTextStorage, didProcessEditing mask: NSTextStorageEditActions,
                      range: NSRange, changeInLength delta: Int) {
         guard mask.contains(.editedCharacters) else { return }
-        Markdown.style(ts)
+        // The cursor isn't placed yet; it usually ends up after the edit. updateReveal fixes the rest.
+        let math = Markdown.style(ts, caret: NSMaxRange(range))
+        (mathRanges, revealed) = (math.all, math.revealed)
     }
 
     // Autosave half a second after you stop typing.
     func textDidChange(_ n: Notification) {
+        updateReveal()
         guard !loading else { return }
         dirty = true
         onTitle?(title)
