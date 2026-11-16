@@ -20,6 +20,9 @@ struct StickyConfig: Codable {
     var zoom: Double?  // web page zoom
     var hidden: Bool?  // hidden with the red button / ⌘W (still running)
     var noteSticky: Bool?  // a note shown as a sticky (⌃Tab, ⌘W hides it), not part of the notes window
+    var stack: UUID?  // stickies with the same stack share one spot, like tabs: one shows, the rest wait behind it
+    var used: Double?  // when you last used it, for ⌃Tab order and which sticky in a stack comes back next
+    var popup: Bool?  // a sign-in popup a page opened: not saved, gone when the page closes it
 }
 
 enum Store {
@@ -79,7 +82,7 @@ final class HoverView: NSView {
 
 // MARK: - One sticky
 
-@MainActor final class StickyController: NSObject, NSWindowDelegate, LocalProcessTerminalViewDelegate, WKUIDelegate {
+@MainActor final class StickyController: NSObject, NSWindowDelegate, LocalProcessTerminalViewDelegate, WKUIDelegate, WKNavigationDelegate {
     static let fadedAlpha: CGFloat = 0.4
 
     var config: StickyConfig
@@ -89,7 +92,6 @@ final class HoverView: NSView {
     private var term: LocalProcessTerminalView?
     private var web: WKWebView?
     private var titleObserver: NSKeyValueObservation?
-    private var popups: [NSPanel] = []
     private var note: NoteEditor?
     private var urlObserver: NSKeyValueObservation?
     private var visitHost: String?
@@ -97,11 +99,15 @@ final class HoverView: NSView {
     /// Restored at launch: the first page load isn't a new visit for site ranking.
     var skipFirstVisit = false
     /// For the ⌃Tab switcher: most recently used first, plus a picture of the sticky.
-    var lastFocused = Date.distantPast
+    var lastFocused: Date {
+        get { config.used.map(Date.init(timeIntervalSince1970:)) ?? .distantPast }
+        set { config.used = newValue.timeIntervalSince1970 }
+    }
     var thumbnail: NSImage?
     private var thumbnailSoon: DispatchWorkItem?
 
-    init(config: StickyConfig, app: AppDelegate, cascade: Int, restoring: Bool = false) {
+    /// `webConfig`: a page asked for a new window, and WebKit gives the settings for it.
+    init(config: StickyConfig, app: AppDelegate, cascade: Int, restoring: Bool = false, webConfig: WKWebViewConfiguration? = nil) {
         self.config = config
         self.app = app
         let start = CGRect(x: 160 + cascade * 30, y: 420 - cascade * 30, width: 560, height: 400)
@@ -138,7 +144,7 @@ final class HoverView: NSView {
         skipFirstVisit = restoring
         switch config.kind {
         case .terminal: setUpTerminal(in: container)
-        case .web: setUpWeb(in: container)
+        case .web: setUpWeb(in: container, given: webConfig)
         case .note: setUpNote(in: container)
         }
     }
@@ -367,13 +373,14 @@ final class HoverView: NSView {
         QuickPicker.shared.present(placeholder: "Search actions…", items: items, over: panel)
     }
 
-    private func setUpWeb(in container: NSView) {
-        let cfg = WKWebViewConfiguration()
-        if #available(macOS 15.4, *) { cfg.webExtensionController = ExtensionHost.shared.controller }
+    private func setUpWeb(in container: NSView, given: WKWebViewConfiguration?) {
+        let cfg = given ?? WKWebViewConfiguration()
+        if given == nil, #available(macOS 15.4, *) { cfg.webExtensionController = ExtensionHost.shared.controller }
         let w = WKWebView(frame: container.bounds, configuration: cfg)
         w.autoresizingMask = [.width, .height]
         w.allowsBackForwardNavigationGestures = true
         w.uiDelegate = self
+        w.navigationDelegate = self
         w.isInspectable = true  // right-click → Inspect Element, for debugging
         w.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
         w.allowsMagnification = true  // trackpad pinch
@@ -381,7 +388,8 @@ final class HoverView: NSView {
         container.addSubview(w)
         web = w
         panel.keyHandler = { [weak self] e in self?.handleStickyKey(e) ?? false }
-        if let u = URL(string: config.url ?? "") { w.load(URLRequest(url: u)) }
+        // A window a page opened: WebKit loads it. Otherwise load the saved address.
+        if given == nil, let u = URL(string: config.url ?? "") { w.load(URLRequest(url: u)) }
         panel.title = config.url ?? "Web"
         titleObserver = w.observe(\.title) { [weak self] w, _ in
             MainActor.assumeIsolated {
@@ -405,9 +413,15 @@ final class HoverView: NSView {
         // stayed 3 seconds, so sign-in pages you pass through on the way don't count.
         urlObserver = w.observe(\.url) { [weak self] w, _ in
             MainActor.assumeIsolated {
-                guard let self, let u = w.url, let host = Sites.key(for: u), host != self.visitHost else { return }
+                guard let self, let u = w.url else { return }
+                // A window a page opened (often about:blank first): remember its first real address.
+                if self.config.url?.hasPrefix("http") != true, u.scheme?.hasPrefix("http") == true {
+                    self.config.url = u.absoluteString
+                    self.app?.persist()
+                }
+                guard let host = Sites.key(for: u), host != self.visitHost else { return }
                 self.visitHost = host
-                if self.skipFirstVisit { self.skipFirstVisit = false; return }
+                if self.skipFirstVisit || self.config.popup == true { self.skipFirstVisit = false; return }  // sign-in popups aren't visits
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self, weak w] in
                     guard let self, let w, self.visitHost == host else { return }
                     let title = w.title ?? ""
@@ -419,6 +433,7 @@ final class HoverView: NSView {
     }
 
     var isWeb: Bool { web != nil }
+    var webView: WKWebView? { web }
     var isTerminal: Bool { term != nil }
     var currentURL: URL? { web?.url ?? URL(string: config.url ?? "") }
 
@@ -519,14 +534,13 @@ final class HoverView: NSView {
         return n > 0
     }
 
-    /// ⌃Tab, let go: this sticky moves into the other one's spot and size, and the other one hides.
-    func takePlace(of other: StickyController) {
-        let frame = other.panel.frame
-        panel.setFrame(frame, display: false)
-        config.frame = frame
-        show()
-        other.hide()
-        app?.persist()
+    /// Showing on screen (not hidden, and not in the middle of hiding).
+    var isShowing: Bool { panel.isVisible && config.hidden != true }
+
+    /// Moves and sizes the sticky (hidden or not), and remembers it.
+    func setFrame(_ f: CGRect) {
+        panel.setFrame(f, display: false)
+        config.frame = f
     }
 
     /// Hides the sticky. It keeps running, and ⌃Tab or the menu bar brings it back.
@@ -579,38 +593,60 @@ final class HoverView: NSView {
 
     private func saveFrame() {
         config.frame = panel.frame
+        app?.stackMoved(self)  // the rest of the stack moves with it
         app?.persist()
     }
 
-    // WKUIDelegate: open sign-in popups in the same sticky, allow file uploads.
+    // WKUIDelegate: a page asks for a new window (a link with target="_blank", or window.open).
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        // Real popup window, so sign-in pages can talk back to the page that opened them.
-        let pop = StickyPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 640),
-            styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
-            backing: .buffered, defer: false)
-        pop.level = .floating
-        pop.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        pop.hidesOnDeactivate = false
-        pop.isReleasedWhenClosed = false
-        let child = WKWebView(frame: pop.contentView!.bounds, configuration: configuration)
-        child.autoresizingMask = [.width, .height]
-        child.customUserAgent = webView.customUserAgent
-        child.uiDelegate = self
-        child.isInspectable = true
-        pop.contentView = child
-        pop.center()
-        popups.append(pop)
-        pop.orderFrontRegardless()
-        pop.makeKey()
-        return child
+        guard let app else { return nil }
+        let url = navigationAction.request.url
+        if let u = url, !Self.opensInSticky(u) { NSWorkspace.shared.open(u); return nil }  // mailto:, zoommtg:, …
+        var c = StickyConfig(kind: .web, url: url?.absoluteString)
+        if windowFeatures.width != nil || windowFeatures.height != nil {
+            // A sized popup, like "Sign in with Google": its own small sticky over this one, until the page closes it.
+            // It's a real window, so the sign-in page can talk back to the page that opened it.
+            c.popup = true
+            var f = CGRect(x: 0, y: 0, width: windowFeatures.width?.doubleValue ?? 480, height: (windowFeatures.height?.doubleValue ?? 640) + 28)
+            f.origin = NSPoint(x: panel.frame.midX - f.width / 2, y: panel.frame.maxY - f.height - 30)
+            if let s = panel.screen?.visibleFrame {
+                f.origin.x = min(max(f.origin.x, s.minX), s.maxX - f.width)
+                f.origin.y = min(max(f.origin.y, s.minY), s.maxY - f.height)
+            }
+            c.frame = f
+            return app.open(c, webConfig: configuration).webView
+        }
+        // A link that opens a new tab: it opens on top of this sticky's stack. ⌘W goes back.
+        c.frame = panel.frame
+        let s = app.open(c, show: false, webConfig: configuration)
+        app.swap(s, into: self)
+        return s.webView
     }
 
+    /// Web pages open in stickies. Other links (mail, Zoom, App Store) go to their own apps.
+    static func opensInSticky(_ u: URL) -> Bool {
+        ["http", "https", "about", "blob", "data", "file"].contains(u.scheme?.lowercased() ?? "")
+    }
+
+    // WKNavigationDelegate: ⌘-click or middle-click a link opens it on top of the stack, like a new tab.
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void) {
+        // (Not a window that just opened: its first load can carry the same ⌘ click.)
+        if navigationAction.navigationType == .linkActivated, webView.backForwardList.currentItem != nil,
+           navigationAction.modifierFlags.contains(.command) || navigationAction.buttonNumber == 2,
+           let u = navigationAction.request.url, Self.opensInSticky(u), let app {
+            decisionHandler(.cancel)
+            let s = app.open(StickyConfig(kind: .web, url: u.absoluteString, frame: panel.frame), show: false)
+            app.swap(s, into: self)
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    // The page closed its own window (window.close), like a sign-in popup when you're done.
     func webViewDidClose(_ webView: WKWebView) {
-        guard let pop = popups.first(where: { $0.contentView === webView }) else { return }
-        pop.close()
-        popups.removeAll { $0 === pop }
+        if webView === web { panel.close() }
     }
 
     func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
@@ -624,7 +660,7 @@ final class HoverView: NSView {
     // NSWindowDelegate
     func windowDidBecomeKey(_ n: Notification) {
         updateAlpha()
-        if inNotesGroup { app?.noteBecameKey(self) } else { lastFocused = Date() }
+        if inNotesGroup { app?.noteBecameKey(self) } else { lastFocused = Date(); app?.persist() }
     }
     func windowDidResignKey(_ n: Notification) {
         updateAlpha()
@@ -632,7 +668,8 @@ final class HoverView: NSView {
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         // Red button / ⌘W only hides stickies (web, terminal, note stickies). ⇧⌘W closes them for good.
-        if !inNotesGroup { hide(); return false }
+        // In a stack, only the top one hides, and the one under it shows.
+        if !inNotesGroup { app?.dismiss(self); return false }
         guard app?.shouldHideInsteadOfClose(self) == true else { return true }
         note?.saveNow()
         panel.orderOut(nil)
@@ -695,9 +732,12 @@ final class HoverView: NSView {
             }
             // Stickies come back where they were. The notes window stays hidden until ⌃⌘B,
             // like Raycast Notes.
-            for c in Store.load() {
+            loading = true  // don't save (or tidy up stacks) until every sticky is back
+            for c in Self.upgradeStacks(Store.load()) {
                 open(c, show: (c.kind != .note || c.noteSticky == true) && c.hidden != true, restoring: true)
             }
+            loading = false
+            persist()
             if stickies.isEmpty { newClaudeHere(folder: NSHomeDirectory() + "/Documents") }
             // Debug: STICKY_DEBUG_BROWSE=1 opens the ⌘P note switcher on launch.
             if ProcessInfo.processInfo.environment["STICKY_DEBUG_BROWSE"] != nil, let n = noteStickies.first {
@@ -710,6 +750,21 @@ final class HoverView: NSView {
                 }
             }
         }
+    }
+
+    /// One time, from before stacks: stickies swapped into the exact same spot become one stack.
+    private static func upgradeStacks(_ list: [StickyConfig]) -> [StickyConfig] {
+        let key = "didUpgradeStacks"
+        guard !UserDefaults.standard.bool(forKey: key) else { return list }
+        UserDefaults.standard.set(true, forKey: key)
+        var list = list
+        let candidates = list.indices.filter { (list[$0].kind != .note || list[$0].noteSticky == true) && list[$0].frame != nil }
+        let bySpot = Dictionary(grouping: candidates) { "\(list[$0].frame!)" }
+        for (_, group) in bySpot where group.count > 1 && group.contains(where: { list[$0].hidden == true }) {
+            let id = UUID()
+            group.forEach { list[$0].stack = id }
+        }
+        return list
     }
 
     // Menu bar icon
@@ -792,7 +847,17 @@ final class HoverView: NSView {
         let list = otherStickies
         guard !list.isEmpty, let anchor = stickiesToggleItem, var i = menu.items.firstIndex(of: anchor) else { return }
         func put(_ item: NSMenuItem) { item.tag = Self.listTag; i += 1; menu.insertItem(item, at: i) }
-        for s in list {
+        // A stack is listed together: the one on top, then the ones behind it, indented.
+        var ordered: [StickyController] = []
+        for s in list where !ordered.contains(where: { $0 === s }) {
+            guard s.config.stack != nil else { ordered.append(s); continue }
+            let all = ([s] + mates(of: s)).sorted { $0.isShowing != $1.isShowing ? $0.isShowing : $0.lastFocused > $1.lastFocused }
+            ordered += all
+        }
+        var placed: [StickyController] = []
+        for s in ordered {
+            let behind = s.config.stack != nil && placed.contains { $0.config.stack == s.config.stack }
+            placed.append(s)
             let full = s.displayTitle
             let name = full.count > 42 ? String(full.prefix(41)) + "…" : full
             let item = NSMenuItem(title: name, action: #selector(menuToggleSticky(_:)), keyEquivalent: "")
@@ -800,6 +865,7 @@ final class HoverView: NSView {
             item.representedObject = s
             item.state = s.panel.isVisible ? .on : .off
             item.image = NSImage(systemSymbolName: s.symbolName, accessibilityDescription: nil)
+            item.indentationLevel = behind ? 1 : 0
             put(item)
             let close = NSMenuItem(title: "Close “\(name)” for Good", action: #selector(menuCloseSticky(_:)), keyEquivalent: "")
             close.target = self
@@ -807,6 +873,7 @@ final class HoverView: NSView {
             close.keyEquivalentModifierMask = .option
             close.isAlternate = true
             close.image = NSImage(systemSymbolName: "xmark.circle", accessibilityDescription: nil)
+            close.indentationLevel = item.indentationLevel
             put(close)
         }
         let hint = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -819,7 +886,7 @@ final class HoverView: NSView {
 
     @objc func menuToggleSticky(_ sender: NSMenuItem) {
         guard let s = sender.representedObject as? StickyController else { return }
-        if s.panel.isVisible { s.hide() } else { s.show() }
+        if s.panel.isVisible { dismiss(s) } else { raise(s) }
     }
 
     @objc func menuCloseSticky(_ sender: NSMenuItem) {
@@ -831,6 +898,74 @@ final class HoverView: NSView {
     func switchStickies(back: Bool, holding mods: NSEvent.ModifierFlags) {
         let list = otherStickies.sorted { $0.lastFocused > $1.lastFocused }
         StickySwitcher.shared.step(back: back, holding: mods, stickies: list)
+    }
+
+    // MARK: Stacks
+    // Stickies can share one spot, like tabs. One shows; the rest wait behind it, hidden but still running.
+    // ⌃Tab (let go) and links that open a new window put a sticky on top. ⌘W takes the top one off.
+
+    /// The other stickies in s's stack, most recently used first.
+    func mates(of s: StickyController) -> [StickyController] {
+        guard let id = s.config.stack else { return [] }
+        return otherStickies.filter { $0 !== s && $0.config.stack == id }.sorted { $0.lastFocused > $1.lastFocused }
+    }
+
+    /// Shows s on top of its stack, in the stack's spot. The one that was on top waits behind it.
+    func raise(_ s: StickyController) {
+        let showing = mates(of: s).filter(\.isShowing)
+        if let top = showing.first { s.setFrame(top.panel.frame) }
+        s.show()
+        showing.forEach { $0.hide() }
+        persist()
+    }
+
+    /// ⌃Tab (let go), or a link that opens a new window: s takes out's spot, on top of out's stack.
+    func swap(_ s: StickyController, into out: StickyController) {
+        if s.config.stack == nil || s.config.stack != out.config.stack {
+            leaveStack(s)
+            let id = out.config.stack ?? UUID()
+            out.config.stack = id
+            s.config.stack = id
+        }
+        s.setFrame(out.panel.frame)
+        s.show()
+        if out !== s { out.hide() }
+        persist()
+    }
+
+    /// Takes s out of its stack. If it was the one showing, the next one in the stack shows in its spot.
+    private func leaveStack(_ s: StickyController) {
+        let next = s.isShowing ? mates(of: s).first : nil
+        s.config.stack = nil
+        if let next { next.setFrame(s.panel.frame); next.show() }
+    }
+
+    /// ⌘W, the red button, or clicking a showing sticky in the menu: hides s (it keeps running).
+    /// In a stack, only s comes off the top, and the one under it shows.
+    func dismiss(_ s: StickyController) {
+        guard s.panel.isVisible else { return }
+        leaveStack(s)
+        s.hide()
+        persist()
+    }
+
+    /// ⌃Tab, Return: s shows on its own. If it was waiting in a stack, it leaves the stack.
+    func showSeparately(_ s: StickyController) {
+        if !s.isShowing {
+            s.config.stack = nil
+            // Stacked stickies share a spot, so nudge it over instead of opening right on top.
+            if otherStickies.contains(where: { $0 !== s && $0.isShowing && $0.panel.frame == s.panel.frame }) {
+                s.setFrame(s.panel.frame.offsetBy(dx: 40, dy: -40))
+            }
+        }
+        s.show()
+        persist()
+    }
+
+    /// The stack moves and resizes together.
+    func stackMoved(_ s: StickyController) {
+        guard s.isShowing else { return }
+        for m in mates(of: s) where m.panel.frame != s.panel.frame { m.setFrame(s.panel.frame) }
     }
 
     /// ⇧⌘W, the switcher's W key, or ⌥ in the menu. Asks first if a program is still running.
@@ -1081,9 +1216,10 @@ final class HoverView: NSView {
         if others.contains(where: { $0.panel.isVisible }) {
             others.forEach { $0.panel.orderOut(nil) }
         } else {
-            // Ones you hid on their own stay hidden, unless that's all of them.
+            // Ones you hid on their own stay hidden, unless that's all of them (then the top of each stack).
             let wanted = others.filter { $0.config.hidden != true }
-            (wanted.isEmpty ? others : wanted).forEach { $0.show() }
+            let tops = others.filter { s in mates(of: s).allSatisfy { $0.lastFocused < s.lastFocused } }
+            (wanted.isEmpty ? tops : wanted).forEach { $0.show() }
         }
     }
 
@@ -1125,20 +1261,37 @@ final class HoverView: NSView {
     }
 
     // Bookkeeping
-    func open(_ c: StickyConfig, show: Bool = true, restoring: Bool = false) {
-        let s = StickyController(config: c, app: self, cascade: stickies.count % 8, restoring: restoring)
-        if c.kind != .note { s.lastFocused = restoring ? Date.distantPast.addingTimeInterval(Double(stickies.count)) : Date() }
+    @discardableResult
+    func open(_ c: StickyConfig, show: Bool = true, restoring: Bool = false, webConfig: WKWebViewConfiguration? = nil) -> StickyController {
+        let s = StickyController(config: c, app: self, cascade: stickies.count % 8, restoring: restoring, webConfig: webConfig)
+        if c.kind != .note || c.noteSticky == true {
+            if !restoring { s.lastFocused = Date() }
+            else if c.used == nil { s.lastFocused = Date.distantPast.addingTimeInterval(Double(stickies.count)) }
+        }
         stickies.append(s)
         if show { s.show() }
         persist()
+        return s
     }
 
+    /// A sticky closed for good. If it was on top of a stack, the next one shows in its spot.
     func remove(_ s: StickyController) {
+        let next = s.isShowing ? mates(of: s).first : nil
         stickies.removeAll { $0 === s }
+        if let next { next.setFrame(s.panel.frame); next.show() }
         persist()
     }
 
-    func persist() { Store.save(stickies.map(\.config)) }
+    private var loading = false
+
+    func persist() {
+        guard !loading else { return }
+        // A stack of one is just a sticky.
+        var count: [UUID: Int] = [:]
+        for s in stickies { if let id = s.config.stack { count[id, default: 0] += 1 } }
+        for s in stickies where s.config.stack.map({ count[$0, default: 0] < 2 }) == true { s.config.stack = nil }
+        Store.save(stickies.filter { $0.config.popup != true }.map(\.config))
+    }
 
     // Dialogs
     private func ask(_ title: String, placeholder: String, value: String) -> String? {

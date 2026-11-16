@@ -1,5 +1,5 @@
 // The ⌃Tab sticky switcher. Hold ⌃ and press Tab to move.
-// Let go: the picked sticky swaps into the current sticky's spot (the current one hides), like tabs.
+// Let go: the picked sticky goes on top of the current sticky's stack (the current one waits behind it), like tabs.
 // Return: the picked sticky opens as its own window instead.
 import AppKit
 
@@ -17,7 +17,7 @@ import AppKit
     private var showTimer: Timer?
     private weak var current: StickyController?  // the sticky that gets swapped out
     private var currentWasFocused = false
-    private let hint = NSTextField(labelWithString: "Let go to swap in place  ·  Return to open separately")
+    private let hint = NSTextField(labelWithString: "Let go to stack it here  ·  Return to open separately")
 
     private let tileWidth: CGFloat = 176
     private let thumbHeight: CGFloat = 108
@@ -125,7 +125,7 @@ import AppKit
             return t
         }
         refreshTiles()
-        hint.stringValue = hold.isEmpty ? "Return to swap in place" : "Let go to swap in place  ·  Return to open separately"
+        hint.stringValue = hold.isEmpty ? "Return to stack it here" : "Let go to stack it here  ·  Return to open separately"
         let size = panel.contentView?.fittingSize ?? strip.fittingSize
         panel.setContentSize(size)
         panel.setFrameOrigin(NSPoint(x: area.midX - size.width / 2, y: area.midY - size.height / 2 + area.height * 0.08))
@@ -134,7 +134,9 @@ import AppKit
     private func refreshTiles() {
         for (i, t) in tiles.enumerated() where i < list.count {
             let s = list[i]
-            let state = !s.panel.isVisible ? "hidden" : (s === current ? "current" : "showing")
+            let stacked = s.config.stack != nil
+            let state = s.panel.isVisible ? (s === current ? "current" : "showing")
+                : !stacked ? "hidden" : s.config.stack == current?.config.stack ? "behind this one" : "in a stack"
             t.set(title: s.displayTitle, symbol: s.symbolName, state: state,
                   image: s.thumbnail, selected: i == sel)
         }
@@ -153,14 +155,13 @@ import AppKit
         let target = list[sel]
         let out = current
         end()
-        if mode == .swap, let out, out !== target, out.panel.isVisible {
-            target.takePlace(of: out)
-        } else {
-            // Swapped stickies share a spot, so nudge it over instead of opening right on top.
-            if let out, out !== target, out.panel.isVisible, out.panel.frame == target.panel.frame {
-                target.panel.setFrameOrigin(NSPoint(x: target.panel.frame.minX + 40, y: target.panel.frame.minY - 40))
-            }
-            target.show()
+        guard let app = NSApp.delegate as? AppDelegate else { return }
+        switch mode {
+        case .swap:
+            // Let go: it goes on top of the current sticky's stack. Nothing showing: it comes back on top of its own.
+            if let out, out !== target, out.panel.isVisible { app.swap(target, into: out) } else { app.raise(target) }
+        case .separate:
+            app.showSeparately(target)
         }
     }
 
@@ -185,8 +186,8 @@ import AppKit
         case 124, 125: move(1)  // → ↓
         case 36, 76: commit(hold.isEmpty ? .swap : .separate)  // Return: open on its own (or swap, if there's no key to let go of)
         case 53: cancel()  // Esc
-        case 4:  // H: hide the highlighted sticky
-            list[sel].hide()
+        case 4:  // H: hide the highlighted sticky (in a stack, the next one shows)
+            (NSApp.delegate as? AppDelegate)?.dismiss(list[sel])
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in self?.refreshTiles() }
         case 13:  // W: close the highlighted sticky for good
             let s = list[sel]
