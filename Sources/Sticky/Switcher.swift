@@ -1,4 +1,6 @@
-// The ⌃Tab sticky switcher. Works like ⌘Tab: hold ⌃, press Tab to move, let go to switch.
+// The ⌃Tab sticky switcher. Hold ⌃ and press Tab to move.
+// Let go: the picked sticky swaps into the current sticky's spot (the current one hides), like tabs.
+// Return: the picked sticky opens as its own window instead.
 import AppKit
 
 @MainActor final class StickySwitcher: NSObject, NSWindowDelegate {
@@ -13,7 +15,9 @@ import AppKit
     private var active = false
     private var poll: Timer?
     private var showTimer: Timer?
-    private weak var cameFrom: StickyController?
+    private weak var current: StickyController?  // the sticky that gets swapped out
+    private var currentWasFocused = false
+    private let hint = NSTextField(labelWithString: "Let go to swap in place  ·  Return to open separately")
 
     private let tileWidth: CGFloat = 176
     private let thumbHeight: CGFloat = 108
@@ -45,11 +49,20 @@ import AppKit
         strip.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
         strip.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(strip)
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        hint.alignment = .center
+        hint.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(hint)
+        // The panel is as wide as the tiles or the hint, whichever is wider.
         NSLayoutConstraint.activate([
-            strip.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
-            strip.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
             strip.topAnchor.constraint(equalTo: bg.topAnchor),
-            strip.bottomAnchor.constraint(equalTo: bg.bottomAnchor),
+            strip.centerXAnchor.constraint(equalTo: bg.centerXAnchor),
+            strip.leadingAnchor.constraint(greaterThanOrEqualTo: bg.leadingAnchor),
+            hint.topAnchor.constraint(equalTo: strip.bottomAnchor, constant: -4),
+            hint.centerXAnchor.constraint(equalTo: bg.centerXAnchor),
+            hint.leadingAnchor.constraint(greaterThanOrEqualTo: bg.leadingAnchor, constant: 16),
+            hint.bottomAnchor.constraint(equalTo: bg.bottomAnchor, constant: -10),
         ])
     }
 
@@ -61,9 +74,12 @@ import AppKit
         }
         guard !stickies.isEmpty else { NSSound.beep(); return }
         list = stickies
-        cameFrom = list.first(where: { $0.panel.isKeyWindow })
-        // Like ⌘Tab: start on the sticky before the one you're in.
-        let start = (cameFrom === list.first && list.count > 1) ? 1 : 0
+        // The one to swap out: the sticky you're in, or (from another app) the last one you used that's showing.
+        let focused = list.first(where: { $0.panel.isKeyWindow })
+        currentWasFocused = focused != nil
+        current = focused ?? list.first(where: { $0.panel.isVisible })
+        // Like ⌘Tab: start on the sticky before the current one.
+        let start = (current === list.first && list.count > 1) ? 1 : 0
         sel = back ? list.count - 1 : start
         hold = mods.intersection([.control, .option, .command])
         active = true
@@ -82,7 +98,7 @@ import AppKit
 
     private func checkRelease() {
         guard active else { return }
-        if NSEvent.modifierFlags.intersection(hold).isEmpty { commit() }
+        if NSEvent.modifierFlags.intersection(hold).isEmpty { commit(.swap) }
     }
 
     private func present() {
@@ -104,12 +120,13 @@ import AppKit
         let width = max(110, min(tileWidth, (area.width - 80 - 24 - (n - 1) * 8) / n))
         tiles = list.enumerated().map { i, s in
             let t = Tile(width: width, thumbHeight: thumbHeight * width / tileWidth)
-            t.onClick = { [weak self] in self?.sel = i; self?.commit() }
+            t.onClick = { [weak self] in self?.sel = i; self?.commit(.swap) }
             strip.addArrangedSubview(t)
             return t
         }
         refreshTiles()
-        let size = strip.fittingSize
+        hint.stringValue = hold.isEmpty ? "Return to swap in place" : "Let go to swap in place  ·  Return to open separately"
+        let size = panel.contentView?.fittingSize ?? strip.fittingSize
         panel.setContentSize(size)
         panel.setFrameOrigin(NSPoint(x: area.midX - size.width / 2, y: area.midY - size.height / 2 + area.height * 0.08))
     }
@@ -117,7 +134,7 @@ import AppKit
     private func refreshTiles() {
         for (i, t) in tiles.enumerated() where i < list.count {
             let s = list[i]
-            let state = !s.panel.isVisible ? "hidden" : (s === cameFrom ? "current" : "")
+            let state = !s.panel.isVisible ? "hidden" : (s === current ? "current" : "showing")
             t.set(title: s.displayTitle, symbol: s.isWeb ? "globe" : "terminal", state: state,
                   image: s.thumbnail, selected: i == sel)
         }
@@ -129,15 +146,26 @@ import AppKit
         refreshTiles()
     }
 
-    private func commit() {
+    private enum Mode { case swap, separate }
+
+    private func commit(_ mode: Mode) {
         guard active, sel < list.count else { return end() }
         let target = list[sel]
+        let out = current
         end()
-        target.show()
+        if mode == .swap, let out, out !== target, out.panel.isVisible {
+            target.takePlace(of: out)
+        } else {
+            // Swapped stickies share a spot, so nudge it over instead of opening right on top.
+            if let out, out !== target, out.panel.isVisible, out.panel.frame == target.panel.frame {
+                target.panel.setFrameOrigin(NSPoint(x: target.panel.frame.minX + 40, y: target.panel.frame.minY - 40))
+            }
+            target.show()
+        }
     }
 
     private func cancel() {
-        let back = cameFrom
+        let back = currentWasFocused ? current : nil
         end()
         back?.show()
     }
@@ -155,7 +183,7 @@ import AppKit
         case 48: move(e.modifierFlags.contains(.shift) ? -1 : 1)  // Tab
         case 123, 126: move(-1)  // ← ↑
         case 124, 125: move(1)  // → ↓
-        case 36, 76: commit()  // Return, Enter
+        case 36, 76: commit(hold.isEmpty ? .swap : .separate)  // Return: open on its own (or swap, if there's no key to let go of)
         case 53: cancel()  // Esc
         case 4:  // H: hide the highlighted sticky
             list[sel].hide()

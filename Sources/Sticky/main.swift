@@ -386,14 +386,19 @@ final class HoverView: NSView {
                 }
             }
         }
-        // A new site (not every page) counts as a visit, for ranking the site list.
+        // A new site (not every page) counts as a visit, for ranking the site list. Only once you've
+        // stayed 3 seconds, so sign-in pages you pass through on the way don't count.
         urlObserver = w.observe(\.url) { [weak self] w, _ in
             MainActor.assumeIsolated {
                 guard let self, let u = w.url, let host = Sites.key(for: u), host != self.visitHost else { return }
                 self.visitHost = host
                 if self.skipFirstVisit { self.skipFirstVisit = false; return }
-                Sites.shared.recordVisit(u, title: w.title ?? "")
-                self.visitNeedsTitle = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self, weak w] in
+                    guard let self, let w, self.visitHost == host else { return }
+                    let title = w.title ?? ""
+                    Sites.shared.recordVisit(u, title: title)
+                    self.visitNeedsTitle = title.isEmpty
+                }
             }
         }
     }
@@ -497,6 +502,16 @@ final class HoverView: NSView {
         var pids = [pid_t](repeating: 0, count: 64)
         let n = proc_listchildpids(t.process.shellPid, &pids, Int32(pids.count * MemoryLayout<pid_t>.size))
         return n > 0
+    }
+
+    /// ⌃Tab, let go: this sticky moves into the other one's spot and size, and the other one hides.
+    func takePlace(of other: StickyController) {
+        let frame = other.panel.frame
+        panel.setFrame(frame, display: false)
+        config.frame = frame
+        show()
+        other.hide()
+        app?.persist()
     }
 
     /// Hides the sticky. It keeps running, and ⌃Tab or the menu bar brings it back.
