@@ -26,7 +26,7 @@ enum Action: String, CaseIterable {
         switch self {
         case .toggleNotes: return "Show / Hide Notes"
         case .newNoteGlobal: return "New Note (from anywhere)"
-        case .toggleAll: return "Show / Hide All Stickies"
+        case .toggleAll: return "Show / Hide Stickies (not notes)"
         case .newNote: return "New Note"
         case .browseNotes: return "Browse Notes"
         case .actionPanel: return "Show Actions"
@@ -35,7 +35,7 @@ enum Action: String, CaseIterable {
         case .duplicateNote: return "Duplicate Note"
         case .copyNote: return "Copy Note as Markdown"
         case .revealNote: return "Show Note in Finder"
-        case .openInNewSticky: return "Open Note in New Sticky"
+        case .openInNewSticky: return "Open Note in New Window"
         case .back: return "Back"
         case .forward: return "Forward"
         case .nextRecent: return "Next Recent Note"

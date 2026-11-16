@@ -446,6 +446,12 @@ final class HoverView: NSView {
         if isNote { app?.noteBecameKey(self) }
     }
     func windowDidResignKey(_ n: Notification) { updateAlpha() }
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard app?.shouldHideInsteadOfClose(self) == true else { return true }
+        note?.saveNow()
+        panel.orderOut(nil)
+        return false
+    }
     func windowDidMove(_ n: Notification) { saveFrame() }
     func windowDidEndLiveResize(_ n: Notification) { saveFrame() }
     func windowWillClose(_ n: Notification) {
@@ -470,7 +476,6 @@ final class HoverView: NSView {
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var stickies: [StickyController] = []
-    private var hidden = false
     private var hotKeyRefs: [EventHotKeyRef] = []
     private let globalActions: [Action] = Action.allCases.filter(\.isGlobal)
 
@@ -502,7 +507,9 @@ final class HoverView: NSView {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) { ExtensionHost.shared.openPopup(ctx) }
                 }
             }
-            for c in Store.load() { open(c) }
+            // Stickies come back where they were. The notes window stays hidden until ⌃⌘B,
+            // like Raycast Notes.
+            for c in Store.load() { open(c, show: c.kind != .note) }
             if stickies.isEmpty { newClaudeHere(folder: NSHomeDirectory() + "/Documents") }
             // Debug: STICKY_DEBUG_BROWSE=1 opens the ⌘P note switcher on launch.
             if ProcessInfo.processInfo.environment["STICKY_DEBUG_BROWSE"] != nil, let n = noteStickies.first {
@@ -525,13 +532,13 @@ final class HoverView: NSView {
         }
         let k = Keymap.shared
         let m = NSMenu()
+        // Notes and stickies are separate things: each has its own section and its own show/hide.
+        m.addItem(.sectionHeader(title: "Notes"))
         add(m, "Show / Hide Notes   \(k.shortcut(.toggleNotes))", #selector(toggleNotes))
         add(m, "New Note   \(k.shortcut(.newNoteGlobal))", #selector(newNote))
         add(m, "Open Note File…", #selector(openNote))
         add(m, "Open Notes Folder", #selector(revealNotes))
-        add(m, "Edit Keybindings…", #selector(editKeybindings))
         if SyncEngine.shared.isConfigured {
-            m.addItem(.separator())
             let status = NSMenuItem(title: SyncEngine.shared.statusText, action: nil, keyEquivalent: "")
             status.isEnabled = false
             m.addItem(status)
@@ -541,29 +548,29 @@ final class HoverView: NSView {
             add(m, "Open Notes on the Web", #selector(openWebNotes))
         }
         m.addItem(.separator())
+        m.addItem(.sectionHeader(title: "Stickies"))
+        add(m, "Show / Hide Stickies   \(k.shortcut(.toggleAll))", #selector(toggleAll))
         add(m, "New Claude Code Sticky (web)", #selector(newClaudeCodeWeb))
         add(m, "New Claude CLI Sticky…", #selector(newClaude))
         add(m, "New Terminal Sticky…", #selector(newTerminal))
         add(m, "New Web Sticky…", #selector(newWeb))
-        m.addItem(.separator())
         if #available(macOS 15.4, *) {
+            m.addItem(.separator())
             let host = ExtensionHost.shared
             host.anchor = statusItem.button
-            let header = NSMenuItem(title: "Extensions", action: nil, keyEquivalent: "")
-            header.isEnabled = false
-            m.addItem(header)
+            m.addItem(.sectionHeader(title: "Web Extensions"))
             for ctx in host.contexts where host.hasPopup(ctx) {
-                let item = NSMenuItem(title: "   \(host.name(ctx))…", action: #selector(openExtension(_:)), keyEquivalent: "")
+                let item = NSMenuItem(title: "\(host.name(ctx))…", action: #selector(openExtension(_:)), keyEquivalent: "")
                 item.target = self
                 item.representedObject = ctx
                 item.image = ctx.webExtension.icon(for: NSSize(width: 16, height: 16))
                 m.addItem(item)
             }
-            add(m, "   Add Extension…", #selector(addExtension))
-            add(m, "   Open Extensions Folder", #selector(revealExtensions))
+            add(m, "Add Extension…", #selector(addExtension))
+            add(m, "Open Extensions Folder", #selector(revealExtensions))
         }
         m.addItem(.separator())
-        add(m, "Show / Hide All   \(k.shortcut(.toggleAll))", #selector(toggleAll))
+        add(m, "Edit Keybindings…", #selector(editKeybindings))
         add(m, "Open Saved Stickies File", #selector(revealStore))
         loginItem = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin), keyEquivalent: "")
         loginItem.target = self
@@ -783,9 +790,21 @@ final class HoverView: NSView {
         open(StickyConfig(kind: .web, url: url))
     }
 
+    /// Shows or hides the terminal and web stickies. Never touches the notes window (that's ⌃⌘B).
     @objc func toggleAll() {
-        hidden.toggle()
-        for s in stickies { hidden ? s.panel.orderOut(nil) : s.show() }
+        let others = stickies.filter { !$0.isNote }
+        if others.contains(where: { $0.panel.isVisible }) {
+            others.forEach { $0.panel.orderOut(nil) }
+        } else {
+            others.forEach { $0.show() }
+        }
+    }
+
+    /// Closing the last notes window only hides it, so ⌃⌘B brings it back in the same spot.
+    func shouldHideInsteadOfClose(_ s: StickyController) -> Bool {
+        // Only for notes from the notes folder (not, say, the keybindings file).
+        let isLibraryNote = { (c: StickyController) in c.isNote && !(c.config.note ?? "").hasPrefix("/") }
+        return isLibraryNote(s) && stickies.filter(isLibraryNote).count == 1
     }
 
     // Open at login (macOS login items). Turned on once on first launch; the menu toggles it.
@@ -819,11 +838,10 @@ final class HoverView: NSView {
     }
 
     // Bookkeeping
-    func open(_ c: StickyConfig) {
+    func open(_ c: StickyConfig, show: Bool = true) {
         let s = StickyController(config: c, app: self, cascade: stickies.count % 8)
         stickies.append(s)
-        hidden = false
-        s.show()
+        if show { s.show() }
         persist()
     }
 

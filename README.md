@@ -10,8 +10,8 @@ Floating, always-on-top windows for macOS. Each sticky runs a terminal command o
 - **Web sticky** — any website. Sign-ins are saved. ⌘- / ⌘= / ⌘0 zoom the page (or pinch), and each sticky remembers its zoom.
 - **Notes** — works like Raycast Notes. **⌃⌘B** shows or hides the notes window, which shows one note at a time. Markdown formats as you type: headings, **bold**, *italic*, underline, ~~strike~~, `code`, code blocks, quotes, links, and clickable `- [ ]` checklists. Return starts a new paragraph (or list item), Shift+Return adds a line break in the same paragraph, Tab indents lists. Notes autosave as plain `.md` files in `~/Documents/Sticky Notes`.
 - Fades to 40% when the mouse leaves and the window isn't focused.
-- **⌃⌥Space** shows or hides all stickies (no Accessibility permission needed).
-- Remembers each sticky's position and reopens them on launch.
+- Notes and stickies stay separate. **⌃⌘B** only shows or hides the notes window, and **⌃⌥Space** only shows or hides the terminal and web stickies. Neither shortcut touches the other (no Accessibility permission needed).
+- Remembers each sticky's position and reopens them on launch. The notes window stays hidden at launch until you press ⌃⌘B, and closing it only hides it, so it comes back in the same spot.
 - Optional **Open at Login** toggle in the menu.
 - Lives in the menu bar, no Dock icon.
 
@@ -27,7 +27,7 @@ All of these can be changed (see **Keybindings** below).
 | Open pinned note 1–9 | ⌘1–⌘9 | Next / previous recent note | ⌃⇥ / ⌃⇧⇥ |
 | Back / forward | ⌘[ / ⌘] | Find in note | ⌘F |
 | Zoom in / out / reset | ⌘= / ⌘- / ⌘0 | Hide notes window | Esc |
-| Copy note as Markdown | ⇧⌘C | Open note in new sticky | ⇧⌘N |
+| Copy note as Markdown | ⇧⌘C | Open note in new window | ⇧⌘N |
 | Bold / italic / underline | ⌘B / ⌘I / ⌘U | Strikethrough | ⇧⌘S |
 | Inline code / link | ⌘E / ⌘L | Code block | ⌥⌘C |
 | Heading 1 / 2 / 3 | ⌥⌘1 / 2 / 3 | Blockquote | ⇧⌘B |
