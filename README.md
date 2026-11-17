@@ -6,7 +6,7 @@ Floating, always-on-top windows for macOS. Each sticky runs a terminal command, 
 
 - **Claude Code (web) sticky** — opens `claude.ai/code` in a floating window. Turn on Remote Control in the Claude desktop app to drive sessions on your Mac from it.
 - **Claude CLI sticky** — runs `claude` in a folder you pick.
-- **Claude chat sticky** — press **⌘O** in any sticky (or menu bar → **Open Claude Chat…**) to search every Claude Code chat on this Mac, newest first: ones from the terminal, the Claude app and Sticky (the earlier parts of a long Claude app chat show as rows of their own). Pick one and it opens in a clean chat view on top of the sticky's stack (if a sticky already shows it, that one comes up), and you can keep going right there. Claude only starts when you send. It asks before it runs a tool (Allow, Deny, or allow it for the rest of the chat), shows questions and plans as cards, and keeps working while the sticky is hidden. The footer picks the permission mode (Ask first, Accept edits, Plan, Auto) and the model, and shows what the chat cost. Esc stops a reply. Menu bar → **New Claude Chat…** starts one in a folder you pick.
+- **Claude chat sticky** — press **⌘O** in any sticky (or menu bar → **Open Claude Chat…**) to search every Claude Code chat on this Mac, newest first: ones from the terminal, the Claude app and Sticky (the earlier parts of a long Claude app chat show as rows of their own). Pick one and it opens in a clean chat view on top of the sticky's stack (if a sticky already shows it, that one comes up), and you can keep going right there. Claude only starts when you send. It asks before it runs a tool (Allow, Deny, or allow it for the rest of the chat, which Sticky keeps while the sticky is open), shows questions and plans as cards, and keeps working while the sticky is hidden. The footer picks the permission mode (Ask first, Accept edits, Plan, Auto) and the model, and shows what the chat cost. Esc stops a reply. Menu bar → **New Claude Chat…** starts one in a folder you pick.
 - **Terminal sticky** — runs any command (`python3`, `htop`, `npm run dev`, …). When it exits you get a normal shell.
 - **Web sticky** — any website. Sign-ins are saved. ⌘- / ⌘= / ⌘0 zoom the page (or pinch), and each sticky remembers its zoom.
 - **Sticky switcher** — hold **⌃** and press **Tab** in any sticky (or **⌥Tab** from any app) to see all your web and terminal stickies with a picture of each, hidden ones too. **Let go** and the one you picked goes on top of the current sticky's stack (see below), like tabs in one window. **Return** opens it as its own window instead. A quick tap swaps back to the last one.
@@ -21,6 +21,40 @@ Floating, always-on-top windows for macOS. Each sticky runs a terminal command, 
 - Remembers each sticky's position and reopens them on launch. The notes window stays hidden at launch until you press ⌃⌘B, and closing it only hides it, so it comes back in the same spot.
 - Optional **Open at Login** toggle in the menu.
 - Lives in the menu bar, no Dock icon.
+
+## Sync with the Claude app
+
+Menu bar → **Sync with Claude App** lets chat stickies and the Claude desktop app share chats. It's off until you turn it on, and it all stays on this Mac: no Remote Control, no cloud.
+
+- **Send into the app's chat:** when the Claude app has a chat open, a message you send from its sticky runs there, as your own message in the same chat. The app stays in the background. The reply shows in the sticky as the app writes it to the chat's file, and Stop (Esc) stops it. Messages you sent that haven't started yet come back to the box when you press Stop.
+- **New chats start in the app,** so they're in its sidebar. The first message opens the app's new-chat page with your text and folder filled in (the app comes forward this once). Confirm the folder there and press Return. The sticky finds that chat, follows it from then on and comes back to the front. Pick the mode and model on that page (the sticky's menus wait until the chat has started). **Start here instead** starts the chat in Sticky, like before; **Cancel** puts the message back in the box.
+- **A rewind or /clear in the app** starts a new part of the chat. When the app has that part open, the sticky follows it. Otherwise the sticky asks: **Open in Claude**, or **Send here anyway** (into the part before).
+- **Chats nothing has open** run in Sticky's own `claude`, which quits a few seconds after each reply. That way the chat's file always says where the chat ends, so the app (or a terminal) carries on from there. A `claude` that runs a background task (a dev server, say) stays until the task ends. If another Claude adds to the chat meanwhile, Sticky asks before it restarts its `claude`, because that ends the task, and it stops its `claude` rather than let it write next to another Claude.
+- **Open elsewhere, without the mod:** if another Claude has the chat open but can't take messages from Sticky (sync is off, or the chat was open before sync was on), Sticky writes nothing to it. The sticky says so and offers **Open in Claude** and **Send as a copy** (a copy of the chat that this sticky shows from then on).
+
+**The mod.** Turning sync on adds a small Claude Code mod, `sticky-bridge`, for your user. Its source is in [`mods/sticky-bridge`](mods/sticky-bridge). Sticky asks first, writes the mod into `~/Library/Application Support/Sticky/claude-mod/`, and runs:
+
+```
+claude plugin marketplace add <that folder> --scope user
+claude plugin install sticky-bridge@sticky-local --scope user
+```
+
+These add the `sticky-local` marketplace and enable `sticky-bridge@sticky-local` in Claude Code's user settings (`~/.claude/settings.json`). In each Claude chat you run (in the Claude app, or `claude` in a terminal), the mod:
+
+- writes a small lease file every 3 seconds: this chat is open, and whether a reply is running;
+- checks Sticky's outbox for this chat twice a second, sends what Sticky left there as your own message (or stops the reply, for Stop), and writes an answer file.
+
+It reads and writes only Sticky's bridge folder, `~/Library/Application Support/Sticky/bridge/`, and acts only on the files Sticky leaves in the outbox of its own chat. It never makes a folder: without the ones Sticky makes, it writes nothing. It refuses links and big files, makes no network calls, starts no processes and calls no MCP tools. In Sticky's own `claude` it does nothing, and neither does it in a `claude` that a chat's own tools start (a script's `claude -p`, say). Its log (`log.txt` in the bridge folder) has ids and states, never your messages. Sticky deletes the files it's done with and sweeps leftovers after a day.
+
+**Turn it off** with the same menu item. Sticky runs `claude plugin uninstall sticky-bridge@sticky-local --scope user` and `claude plugin marketplace remove sticky-local`, and deletes the mod's folder. A chat whose Claude is already running keeps the mod until that process ends, but Sticky stops sending to it right away. When a new Sticky brings a new mod, Sticky rewrites the folder at launch, and chats load it when their process next starts.
+
+**Limits**
+
+- Chats already open in the Claude app picked up the mod within a few seconds of turning sync on (tested on the app's Claude Code 2.1.321). If one doesn't, quitting and reopening the Claude app restarts its process.
+- Images can't go through the bridge. Add them in the Claude app.
+- Permission prompts for a reply sent from Sticky show in the Claude app. Sticky says so when such a reply has shown nothing new for 20 seconds. The mode and model menus are locked for these chats: set them in the app.
+- If the app doesn't pick a message up within 10 seconds, Sticky takes it back and puts it in the box again (in front of anything you typed since). If the app's plugins reload after the mod took a message but before it sent it, Sticky says so and puts it back too: check the chat before you send it again.
+- The app's new-chat page takes about 12,000 characters. A longer first message, or one with images, starts in Sticky. If you change the text on that page before you press Return, the sticky can't find the chat: use **Start here instead** or **Cancel**.
 
 ## Sticky shortcuts
 
@@ -108,16 +142,16 @@ open ~/Applications/Sticky.app
 
 - **Keychain prompt:** the first time a web sticky saves login data, macOS asks to let Sticky use its "WebCrypto Master Key". WebKit creates this key itself. Click **Always Allow**.
 - **Saved stickies:** `~/Library/Application Support/Sticky/stickies.json`. Builds from before chat stickies can't read a list that has one, and save an empty list over it. Before you run an older build, close chat stickies (⇧⌘W), or put back `stickies-backup.json` (next to it, the last list saved with a chat sticky in it) afterwards.
-- **Claude chats stay local:** Sticky reads Claude Code's own chat files (`~/.claude/projects`) and the Claude app's chat titles, and never edits them itself. Sending continues a chat through the `claude` command on this Mac, which adds to that chat's file (or to a copy, see below). Nothing goes through remote control or the cloud.
-  - **Permissions:** Sticky never turns permission checks off (no bypass mode). In **Ask first**, Claude asks before any tool your Claude settings don't already allow (reading files and the like may not ask, as in the terminal). **Accept edits** and **Auto** let it run some tools without asking, as in the CLI. "Always allow" lasts only for that chat, and its button names everything it allows. Claude's settings files are never changed.
+- **Claude chats stay local:** Sticky reads Claude Code's own chat files (`~/.claude/projects`) and the Claude app's chat titles, and never edits them itself. Sending continues a chat through the `claude` command on this Mac, which adds to that chat's file (or to a copy, see below), or, with Sync with Claude App on, through the Claude app's own process for that chat. Nothing goes through remote control or the cloud.
+  - **Permissions:** Sticky never turns permission checks off (no bypass mode). In **Ask first**, Claude asks before any tool your Claude settings don't already allow (reading files and the like may not ask, as in the terminal). **Accept edits** and **Auto** let it run some tools without asking, as in the CLI. "Always allow" lasts only for that chat (while its sticky is open: Sticky starts each new `claude` for the chat with what you allowed), and its button names everything it allows. Sticky never edits Claude's settings files itself (only turning Sync with Claude App on or off changes them, through the `claude plugin` commands above).
   - **Folder trust:** in a folder Claude Code hasn't been told to trust, Sticky asks first ("Trust … ?"), because a folder's own Claude settings, hooks and MCP servers run when Claude starts there. Your answer is kept in `chat-trust.json`; `~/.claude.json` is only read.
-  - **Open in another Claude:** when you send while the chat is open in another Claude (the app or a terminal), Sticky continues it as a copy, so the two never write into one file. If that happens while Sticky's own reply is still running, it asks you to wait for the reply first.
+  - **Open in another Claude:** when another Claude (the app or a terminal) has the chat open, Sticky never writes into it next to that Claude. With Sync with Claude App on and the mod in that chat, your message runs there (see **Sync with the Claude app**). Otherwise the sticky offers **Send as a copy**, which continues a copy of the chat, so the two never write into one file.
   - The ⌘O list is cached in `~/Library/Application Support/Sticky/chat-index.json`, and the chats Sticky started are listed in `chat-own.json` there.
 - **Regular Mac apps can't be floated.** macOS doesn't let one app pin another app's window without disabling System Integrity Protection.
 
 ## Code
 
-Stickies and the app are in [`Sources/Sticky/main.swift`](Sources/Sticky/main.swift). The chat sticky is [`ChatView.swift`](Sources/Sticky/ChatView.swift) (the glue), [`ChatPage.swift`](Sources/Sticky/ChatPage.swift) (the chat page), [`ChatTranscript.swift`](Sources/Sticky/ChatTranscript.swift) (reads one chat file), [`ChatIndex.swift`](Sources/Sticky/ChatIndex.swift) (the ⌘O list) and [`ClaudeProcess.swift`](Sources/Sticky/ClaudeProcess.swift) (runs `claude`). The terminal uses [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm).
+Stickies and the app are in [`Sources/Sticky/main.swift`](Sources/Sticky/main.swift). The chat sticky is [`ChatView.swift`](Sources/Sticky/ChatView.swift) (the glue), [`ChatPage.swift`](Sources/Sticky/ChatPage.swift) (the chat page), [`ChatTranscript.swift`](Sources/Sticky/ChatTranscript.swift) (reads one chat file), [`ChatIndex.swift`](Sources/Sticky/ChatIndex.swift) (the ⌘O list), [`ClaudeProcess.swift`](Sources/Sticky/ClaudeProcess.swift) (runs `claude`) and [`ClaudeBridge.swift`](Sources/Sticky/ClaudeBridge.swift) (Sync with Claude App: the bridge folder, the `claude://` links, installing the mod). The mod itself is in [`mods/sticky-bridge`](mods/sticky-bridge); after you change it, run `mods/embed.sh`, which copies it into [`ClaudeBridgeMod.swift`](Sources/Sticky/ClaudeBridgeMod.swift) (Sticky installs it from there; `mods/embed.sh --check` says whether that file is up to date). The terminal uses [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm).
 
 ## License
 

@@ -237,6 +237,12 @@ final class HoverView: NSView {
             self.thumbnailSoon = job
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: job)
         }
+        c.onFront = { [weak self] in
+            // The Claude app started this new chat (it came forward for that): this sticky comes back on top.
+            guard let self else { return }
+            if let app = self.app { app.raise(self) } else { self.show() }
+        }
+        c.onTurnOnSync = { [weak self] in self?.app?.setClaudeSync(true) }
         c.onOpenURL = { [weak self] u in
             // Like a link that opens a new tab: on top of this sticky's stack, ⌘W comes back.
             guard let self, let app = self.app, ["http", "https"].contains(u.scheme?.lowercased() ?? "") else {
@@ -783,7 +789,7 @@ final class HoverView: NSView {
 
 // MARK: - App
 
-@MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation {
     private var statusItem: NSStatusItem!
     private var stickies: [StickyController] = []
     private var hotKeyRefs: [EventHotKeyRef] = []
@@ -806,11 +812,15 @@ final class HoverView: NSView {
             if let p = Keymap.shared.problems.first { NSSound.beep(); print("Keybindings: \(p)") }
         }
         enableLoginOnFirstRun()
-        // The chat list (⌘O) and claude's PATH, ready before you need them.
+        // The chat list (⌘O) and claude's PATH, ready before you need them. With Sync with Claude App on, the mod's
+        // files are rewritten if this Sticky has a newer one; the bridge folder loses day-old leftovers.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
             MainActor.assumeIsolated {
                 ChatIndex.shared.refresh()
                 ClaudeProcess.warmUp()
+                ClaudeSync.refreshIfNeeded { r in
+                    if !r.ok { print("Sync with Claude App: couldn't update the mod: \(r.message)") }
+                }
             }
         }
 
@@ -901,6 +911,8 @@ final class HoverView: NSView {
         add(m, "New Claude CLI Sticky…", #selector(newClaude))
         add(m, "Open Claude Chat…   \(k.shortcut(.openChat))", #selector(showChats))
         add(m, "New Claude Chat…", #selector(newChat))
+        claudeSyncItem = add(m, "Sync with Claude App", #selector(toggleClaudeSync))
+        claudeSyncItem?.state = ClaudeSync.isOn ? .on : .off
         add(m, "New Terminal Sticky…", #selector(newTerminal))
         add(m, "New Web Sticky…   \(k.shortcut(.newWebSticky))", #selector(newWeb))
         add(m, "New Note Sticky", #selector(newNoteSticky))
@@ -1169,6 +1181,65 @@ final class HoverView: NSView {
     }
 
     @objc func showChats() { showChatPicker(over: nil) }
+
+    // MARK: Sync with Claude App
+
+    private weak var claudeSyncItem: NSMenuItem?
+
+    @objc func toggleClaudeSync() { setClaudeSync(!ClaudeSync.isOn) }
+
+    /// Sync with Claude App is off (and says why) while the claude CLI installs, removes or updates the mod: turning
+    /// it on or off, or the launch refresh. The menu asks each time it opens; every other item stays as it was.
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        guard item.action == #selector(toggleClaudeSync) else { return true }
+        item.title = ClaudeSync.isWorking ? "Sync with Claude App (Working…)" : "Sync with Claude App"
+        item.state = ClaudeSync.isOn ? .on : .off
+        return !ClaudeSync.isWorking
+    }
+
+    /// Turns Sync with Claude App on or off: says what changes in Claude Code first, then shows how it went.
+    func setClaudeSync(_ on: Bool) {
+        guard on != ClaudeSync.isOn, !ClaudeSync.isWorking else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        let dir = (ClaudeSync.modDir.path as NSString).abbreviatingWithTildeInPath
+        if on {
+            a.messageText = "Turn on Sync with Claude App?"
+            a.informativeText = """
+                Sticky adds a small mod, sticky-bridge, to Claude Code for your user. It runs `claude plugin marketplace add \(dir)` \
+                and `claude plugin install \(ClaudeSync.pluginId)`, which change Claude Code's user settings (~/.claude/settings.json).
+
+                In the Claude app's chats (and terminal claude chats), the mod notes that the chat is open, and sends the messages \
+                Sticky leaves for that chat, as your own. It reads and writes only Sticky's bridge folder on this Mac, and uses \
+                no network.
+
+                New chats you start in Sticky open in the Claude app, so they're in its list. Chats already open in the app pick up \
+                the mod within a few seconds. Turn this off here any time; that uninstalls the mod.
+                """
+            a.addButton(withTitle: "Turn On")
+        } else {
+            a.messageText = "Turn off Sync with Claude App?"
+            a.informativeText = """
+                Sticky runs `claude plugin uninstall \(ClaudeSync.pluginId)` and `claude plugin marketplace remove \
+                \(ClaudeSync.marketplace)`, which change Claude Code's user settings, and deletes \(dir). Sticky then sends with \
+                its own claude again, and new chats start in Sticky.
+                """
+            a.addButton(withTitle: "Turn Off")
+        }
+        a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn, !ClaudeSync.isWorking else { return }
+        let done: @MainActor (ClaudeSync.Outcome) -> Void = { [weak self] r in
+            self?.claudeSyncItem?.state = ClaudeSync.isOn ? .on : .off
+            NSApp.activate(ignoringOtherApps: true)
+            let b = NSAlert()
+            b.alertStyle = r.ok ? .informational : .warning
+            b.messageText = r.ok ? (ClaudeSync.isOn ? "Sync with Claude App is on" : "Sync with Claude App is off")
+                                 : (on ? "Couldn't turn on Sync with Claude App" : "Couldn't turn off Sync with Claude App")
+            b.informativeText = r.message
+            b.runModal()
+        }
+        if on { ClaudeSync.turnOn(done) } else { ClaudeSync.turnOff(done) }
+    }
 
     @objc func newChat() {
         guard let f = pickFolder() else { return }

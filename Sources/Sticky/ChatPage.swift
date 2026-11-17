@@ -144,6 +144,7 @@ svg.i { width: 14px; height: 14px; flex: none; fill: none; stroke: currentColor;
 .user.cancelled .bubble, .user.cancelled .imgs { opacity: 0.5; }
 .user.cancelled .bubble { text-decoration: line-through; text-decoration-color: var(--text-3); }
 .user.cancelled .ustate { color: var(--danger); }
+.user.app .bubble { opacity: 0.7; }
 
 /* MARK: - Assistant text (markdown) */
 .asst { position: relative; }
@@ -371,13 +372,21 @@ input[type=checkbox]:checked::after {
 .otext { width: 100%; border: 0; background: transparent; font: inherit; color: var(--text); outline: none; padding: 0; }
 
 #banner {
-  display: flex; align-items: center; gap: 6px; padding: 0 4px 6px; font-size: 11.5px; color: var(--text-2);
-  overflow-wrap: anywhere;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 5px 6px; padding: 0 4px 6px; font-size: 11.5px; color: var(--text-2);
+  overflow-wrap: anywhere; max-height: 40vh; overflow-y: auto;  /* a small sticky keeps its composer in view */
 }
 #banner.bad { color: var(--danger); white-space: normal; }  /* not the tool badge's nowrap */
 #banner > span { min-width: 0; }
+#banner .btxt { flex: 1 1 150px; }
+#banner small { display: block; margin-top: 1px; font-size: 11px; color: var(--text-3); }
 #banner .i { width: 13px; height: 13px; flex: none; }
 #banner code { font: 11px var(--mono); background: var(--tint-2); padding: 0 4px; border-radius: 4px; }
+#banner .bacts { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; margin-left: auto; }
+#banner .b { min-height: 22px; padding: 2px 9px; font-size: 11.5px; border-radius: 7px; color: var(--text-2); }
+#banner .b.pri { color: var(--on-accent); }
+#banner.bad .b:not(.pri) { color: var(--danger); }
+#banner.nudge { animation: nudge 0.45s ease-in-out; }
+@media (max-height: 240px) { #banner small { display: none; } }  /* the line under it stays as the tooltip */
 
 #composer {
   position: relative; border: 1px solid var(--line-2); border-radius: 15px; background: var(--raised);
@@ -400,6 +409,7 @@ input[type=checkbox]:checked::after {
 #send:disabled { cursor: default; background: var(--tint-2); color: var(--text-3); }
 #send .i { width: 15px; height: 15px; stroke-width: 1.8; }
 #send.stop { background: var(--text); color: var(--bg); }
+#send.stop:disabled { background: var(--tint-2); color: var(--text-3); }
 #send.stop .i { width: 10px; height: 10px; fill: currentColor; stroke: none; }
 #thumbs { display: flex; flex-wrap: wrap; gap: 6px; padding: 3px 0 5px; }
 .att { position: relative; }
@@ -431,6 +441,10 @@ input[type=checkbox]:checked::after {
 .dot.plan { background: #3e9f8f; }
 .dot.auto { background: var(--accent); }
 .dot.bypassPermissions { background: var(--danger); }
+.menu.off { opacity: 0.7; }
+.menu.off:hover { background: none; color: inherit; }
+.menu.off select { cursor: default; }
+.menu.off .i { display: none; }
 
 #lightbox {
   position: fixed; inset: 0; z-index: 10; display: flex; align-items: center; justify-content: center; padding: 16px;
@@ -450,6 +464,7 @@ input[type=checkbox]:checked::after {
 }
 
 @keyframes spin { to { transform: rotate(360deg); } }
+@keyframes nudge { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-3px); } 75% { transform: translateX(3px); } }
 @keyframes pulse { 0%, 100% { opacity: 0.35; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1); } }
 @keyframes shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
 @keyframes twirl { 0% { transform: rotate(0) scale(0.9); } 50% { transform: rotate(90deg) scale(1.08); } 100% { transform: rotate(180deg) scale(0.9); } }
@@ -978,6 +993,7 @@ function receive(m) {
     case "permissions": S.perms = m.requests || []; renderPerms(); renderWorking(); break;
     case "status": setStatus(m.s || {}); break;
     case "focus": ta.focus(); break;
+    case "nudge": nudge(); break;
   }
 }
 
@@ -1103,7 +1119,7 @@ function buildUser(text, images, time, state) {
     e.append(b);
   }
   if (state) {
-    const label = { sending: "Sending…", queued: "Queued", cancelled: "Not sent" }[state] || "";
+    const label = { sending: "Sending…", queued: "Queued", cancelled: "Not sent", app: "In the Claude app" }[state] || "";
     if (label) e.append(el("div", "ustate", (state === "sending" ? '<span class="spin on"></span>' : "") + label));
   }
   return e;
@@ -1393,15 +1409,24 @@ function renderPending() {
   syncChildren($("pending"), now);
   syncChildren($("queued"), later);
   renderCenter();
-  // a message that was never sent (Stop, claude quit) goes back in the empty composer, so it isn't lost
-  if (back.length && !ta.value.trim() && !atts.length) {
-    ta.value = back.map((b) => b.text).filter((t) => t).join("\n\n");
+  // a message that was never sent (Stop, claude quit, the app didn't take it) goes back in the composer, in front of
+  // anything typed since, so it isn't lost
+  if (back.length) {
+    const imgs = [];
     for (const b of back) for (const u of b.imgs) {
       const m = /^data:([^;,]+);base64,/.exec(u);
-      if (m) atts.push({ mime: m[1], data: u.slice(m[0].length), url: u });
+      if (m) imgs.push({ mime: m[1], data: u.slice(m[0].length), url: u });
     }
-    renderThumbs(); autosize(); updateSend();
+    putBack(back.map((b) => b.text).filter((t) => t).join("\n\n"), imgs);
   }
+}
+
+/** Puts a message that didn't go back in the composer: in front of what's there now, with a blank line between. */
+function putBack(text, imgs) {
+  const now = ta.value;
+  if (text) ta.value = now.trim() ? text + "\n\n" + now : text;
+  if (imgs.length) atts = imgs.concat(atts);
+  renderThumbs(); autosize(); updateSend();
 }
 
 const ghostEls = new Map(); // key → { sig, el }
@@ -1632,12 +1657,24 @@ function flash(t) {
   renderBanner();
 }
 
+/** Banner buttons: [{id, label, pri?}]. A click runs doAction(id). */
+function bannerActs(list) {
+  const a = (Array.isArray(list) ? list : []).filter((x) => x && x.id && x.label);
+  if (!a.length) return "";
+  return '<div class="bacts">' + a.map((x) =>
+    `<button type="button" class="b${x.pri ? " pri" : ""}" data-act="${esc(x.id)}"><span>${esc(x.label)}</span></button>`).join("") + "</div>";
+}
+const BANNER_ICONS = { app: () => I.app, info: () => I.info, warn: () => I.warn, lock: () => I.lock, spin: () => '<span class="spin on"></span>' };
+
 function renderBanner() {
   const s = S.status, b = $("banner");
   let html = "", bad = false;
-  if (flashText) { html = I.warn + `<span>${titleHtml(flashText)}</span>`; bad = true; }
-  else if (s.error) { html = I.warn + `<span>${titleHtml(s.error)}</span>`; bad = true; }
-  else if (s.readOnly) html = I.lock + `<span>${titleHtml(s.readOnly)}</span>`;
+  const txt = (t, sub) => `<span class="btxt"${sub ? ` title="${esc(sub)}"` : ""}>${titleHtml(t)}${sub ? `<small>${titleHtml(sub)}</small>` : ""}</span>`;
+  const bn = s.banner && typeof s.banner === "object" && s.banner.text ? s.banner : null;
+  if (flashText) { html = I.warn + txt(flashText); bad = true; }
+  else if (s.error) { html = I.warn + txt(s.error) + bannerActs(s.errorActions); bad = true; }
+  else if (s.readOnly) html = I.lock + txt(s.readOnly);
+  else if (bn) html = (BANNER_ICONS[bn.icon] || BANNER_ICONS.info)() + txt(bn.text, bn.sub) + bannerActs(bn.actions);
   else if (s.notice) html = I.info + `<span>${titleHtml(s.notice)}</span>`;
   else if (s.trustWait) html = I.lock + "<span>Your message waits until you answer the card above</span>";
   else if (s.busyElsewhere) html = '<span class="spin on"></span><span>Claude is working on this chat in another Claude (the app or a terminal)…</span>';
@@ -1648,6 +1685,33 @@ function renderBanner() {
   b.hidden = !html;
 }
 
+/** A send that didn't go because of what the banner says: shake it a little. */
+function nudge() {
+  const b = $("banner");
+  b.classList.remove("nudge");
+  void b.offsetWidth;
+  b.classList.add("nudge");
+}
+
+/** A banner button. Send as a copy, Start it here, Send here anyway and Restart and send send the composer's
+ *  message; the rest go to Swift. */
+const SEND_ACTS = {
+  sendCopy: [{ copy: true }, "Type the message to send as a copy."],
+  sendHere: [{ here: true }, "Type the message to start the chat with."],
+  sendAnyway: [{ here: true }, "Type the message to send here."],
+  restartSend: [{ restart: true }, "Type the message to send."],
+  restartCopy: [{ copy: true, restart: true }, "Type the message to send as a copy."],
+};
+function doAction(id) {
+  const act = Object.prototype.hasOwnProperty.call(SEND_ACTS, id) ? SEND_ACTS[id] : null;
+  if (act) {
+    if (!ta.value.trim() && !atts.length) { flash(act[1]); ta.focus(); return; }
+    submit(act[0]);
+    return;
+  }
+  bridge({ type: "action", id: String(id) });
+}
+
 function updateSend() {
   const b = $("send");
   const running = !!S.status.running;
@@ -1655,8 +1719,8 @@ function updateSend() {
   const want = running ? "stop" : "send";
   if (b._mode !== want) { b.innerHTML = running ? I.stop : I.up; b._mode = want; }
   b.classList.toggle("stop", running);
-  b.disabled = !running && (!has || !!S.status.readOnly);
-  b.title = running ? "Stop (Esc)" : "Send (Return)";
+  b.disabled = running ? !!S.status.stopOff : (!has || !!S.status.readOnly);
+  b.title = running ? (S.status.stopOff || "Stop (Esc)") : "Send (Return)";
 }
 
 function renderFooter() {
@@ -1669,16 +1733,19 @@ function renderFooter() {
   const br = $("fBranch");
   br.hidden = !s.branch;
   if (s.branch) { br.innerHTML = I.branch + `<span>${esc(s.branch)}</span>`; br.title = s.branch; }
-  menu($("fMode"), s.modes || [], s.mode, "setMode");
-  menu($("fModel"), s.models || [], s.model, "setModel");
-  $("fMode").querySelector(".dot").className = "dot " + String(s.mode || "").replace(/[^\w-]/g, "");
+  // A chat the Claude app runs has its mode and model set there: the menus show but don't change anything.
+  const lock = s.locked ? String(s.locked) : "";
+  menu($("fMode"), s.modes || [], s.mode, "setMode", lock);
+  menu($("fModel"), s.models || [], s.model, "setModel", lock);
+  $("fMode").querySelector(".dot").className = "dot " + (lock ? "" : String(s.mode || "").replace(/[^\w-]/g, ""));
   const c = $("fCost");
   c.hidden = !s.cost;
   c.textContent = s.cost || "";
 }
 
-/** A footer menu: shows the current label; a native <select> on top opens the macOS menu. */
-function menu(box, options, value, type) {
+/** A footer menu: shows the current label; a native <select> on top opens the macOS menu. `lock`: why it's off
+ *  (the mode menu shows that instead of a mode). */
+function menu(box, options, value, type, lock) {
   const sel = box.querySelector("select");
   const opts = options.filter((o) => o && o.value != null).map((o) => ({ value: String(o.value), label: String(o.label ?? o.value) }));
   if (value && !opts.some((o) => o.value === value)) opts.unshift({ value: String(value), label: String(value) });
@@ -1690,11 +1757,14 @@ function menu(box, options, value, type) {
   }
   if (value != null) sel.value = String(value);
   const cur = opts.find((o) => o.value === sel.value);
-  box.querySelector(".lbl").textContent = cur ? cur.label : "";
-  box.title = cur ? cur.label : "";
+  box.querySelector(".lbl").textContent = lock && type === "setMode" ? lock : cur ? cur.label : "";
+  box.title = lock || (cur ? cur.label : "");
+  sel.disabled = !!lock;
+  box.classList.toggle("off", !!lock);
   if (!sel._wired) {
     sel._wired = true;
     sel.addEventListener("change", () => {
+      if (sel.disabled) return;
       const o = sel.options[sel.selectedIndex];
       box.querySelector(".lbl").textContent = o ? o.textContent : "";
       if (type === "setMode") box.querySelector(".dot").className = "dot " + sel.value.replace(/[^\w-]/g, "");
@@ -1749,7 +1819,9 @@ function addFiles(files) {
   }
 }
 
-async function submit() {
+/** Sends the composer's message. `opts.copy`: Send as a copy; `opts.here`: here, not in the app (a new chat, or Send
+ *  here anyway); `opts.restart`: Restart and send. */
+async function submit(opts) {
   if (sending || S.status.readOnly) return;
   const text = ta.value.trimEnd();
   const sent = atts.slice();
@@ -1760,16 +1832,23 @@ async function submit() {
   stick = true; unseen = false; updateJump(); toBottom(true);
   sending = true;
   let r = null;
-  try { r = await bridge({ type: "send", text, images: sent.map((a) => ({ mime: a.mime, data: a.data })) }); }
+  const msg = { type: "send", text, images: sent.map((a) => ({ mime: a.mime, data: a.data })) };
+  if (opts && opts.copy) msg.copy = true;
+  if (opts && opts.here) msg.here = true;
+  if (opts && opts.restart) msg.restart = true;
+  try { r = await bridge(msg); }
   catch (e) { r = { ok: false, error: String(e) }; }
   sending = false;
   if (r && r.ok === false) {
-    if (!ta.value && !atts.length) { ta.value = text; atts = sent; renderThumbs(); autosize(); updateSend(); }
-    flash(r.error || "Couldn't send that.");
+    putBack(text, sent);  // in front of anything that came back or was typed meanwhile
+    if (!r.quiet) flash(r.error || "Couldn't send that.");  // quiet: the banner says why already
   }
 }
 
-function stop() { bridge({ type: "stop" }); }
+function stop() {
+  if (S.status.stopOff) { flash(S.status.stopOff); return; }  // the Claude app's turn: stopped there
+  bridge({ type: "stop" });
+}
 
 // MARK: - Scrolling: stick to the bottom while new content arrives
 
@@ -1883,6 +1962,10 @@ function start() {
     toggleFold(h.parentElement);
   });
   $("lightbox").addEventListener("click", () => { $("lightbox").hidden = true; });
+  $("banner").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-act]");
+    if (b) { e.preventDefault(); doAction(b.getAttribute("data-act")); }
+  });
 
   // Composer
   ta.addEventListener("input", () => { autosize(); updateSend(); });

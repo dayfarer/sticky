@@ -1,8 +1,17 @@
-// The chat inside a chat sticky: the page, the chat's file, and (only after you send) a claude process.
+// The chat inside a chat sticky: the page, the chat's file, and (only after you send) a way to send.
 //
 // The page (ChatPage) only draws. This keeps it in step with the chat's .jsonl, read on a background queue as
 // it grows, plus what isn't on file yet: messages you just sent, the reply being written, and permission cards.
-// Claude starts on your first message, so restoring ten chat stickies doesn't start ten claudes.
+// Each message goes one of three ways, decided when you send it:
+// 1. The Claude app (or a terminal claude) has the chat open with Sticky's mod (a live lease, Sync with Claude App
+//    on): it goes through the bridge folder and runs there, as your own turn in the chat the app shows.
+// 2. Another Claude has it open without the mod: nothing is written next to it. A banner offers Open in Claude and
+//    Send as a copy.
+// 3. Nothing else has it open: Sticky's own claude runs the turn, and quits a few seconds after it (so the file
+//    says where the chat ends, for the next Claude that opens it). Restoring ten chat stickies starts no claude.
+// With sync on, a new chat's first message goes to the Claude app's new-chat page, and the sticky follows the chat
+// the app starts. When an app chat goes on under another id (a rewind or /clear there), the sticky follows it if a
+// Claude has that open, and otherwise asks before it writes into the older part.
 import AppKit
 import WebKit
 
@@ -22,14 +31,17 @@ import WebKit
         if let p = meta.firstPrompt, !p.isEmpty { return Self.oneLine(p, 60) }
         return "New chat"
     }
-    /// A turn is running, a permission card is waiting, or claude runs a background task (a dev server, say).
-    var isBusy: Bool { running || !cards.isEmpty || (process != nil && bgTasks > 0) }
+    /// Our claude runs a turn, a permission card is waiting, or it runs a background task (a dev server, say).
+    /// (A turn the Claude app runs goes on without this sticky.)
+    var isBusy: Bool { ownRunning || !cards.isEmpty || (process != nil && bgTasks > 0) }
 
     var onTitle: ((String) -> Void)?       // the sticky's title should change ("● " in front while running)
     var onSession: ((String) -> Void)?     // the chat's id changed (a new chat got its id, a copy, /clear)
     var onSettings: ((_ mode: String?, _ model: String?) -> Void)?  // you changed the mode or model
     var onActivity: (() -> Void)?          // new content (refresh the switcher picture soon)
     var onOpenURL: ((URL) -> Void)?
+    var onFront: (() -> Void)?             // the Claude app started this new chat: bring the sticky back to the front
+    var onTurnOnSync: (() -> Void)?        // the banner's "Turn on Sync with Claude App"
 
     // MARK: State
 
@@ -102,11 +114,55 @@ import WebKit
     private var cost: String?
     private var error: String?
     private var notice: String?
+    private var startNotice: String?         // why a new chat starts here, not in the Claude app: shown once it starts
+    private var grantRules: [String] = []    // "Always allow … in this chat" rules: every new claude of this chat gets them
+    private var grantDirs: [String] = []     // and the folders granted that way
     private var idleWork: DispatchWorkItem?
     private var closed = false
+    private var restart: [Outgoing] = []     // sent while our claude was still quitting: they go once it's gone
+    private var restartCopy = false
+    private var heldCopy = false             // what waits on "Trust this folder?" goes as a copy
 
-    /// A turn is running, or a message waits for one.
-    private var running: Bool { process != nil && (turn || pending.contains { $0.state == "queued" }) }
+    // The Claude app (Sync with Claude App)
+    private var lease: BridgeLease?          // the Claude app (or a terminal claude) has it open, with Sticky's mod
+    private var rawLease: BridgeLease?       // the same whether sync is on or not (a message the mod took may still run)
+    private var leaseSeq = 0                 // a read that started before a newer one is dropped
+    private var checkingLease = false
+    private var sends: [String: BridgeSend] = [:]  // handed to the mod, not answered yet
+    private var ackTimer: Timer?
+    private var appTurnSince: Double?        // when the app's turn was first seen running (uptime)
+    private var itemsAt = 0.0                // when the file last gained an item (uptime)
+    private var appQuiet = false             // the app's turn has run 20 s with nothing new on file
+    private var errorActions: [String] = []  // buttons beside `error`
+    private var newChat: NewChatWait?        // the first message waits on the Claude app's new-chat page
+    private var newChatTimer: Timer?
+    private var findingChat = false
+    private var syncObserver: NSObjectProtocol?
+    // The Claude app chat went on under another id (a rewind or /clear there)
+    private var appCurrent: String?          // an id seen as the app chat's current part (only that one is followed)
+    private var movedTo: String?             // its newer part, when nothing has that open (a banner asks)
+    private var stayHere: String?            // "Send here anyway" was picked for this id
+    private var checkingMove = false
+    private var moveStat: AppPart?           // the app's session file as last read
+
+    private typealias Outgoing = (uuid: String, text: String, images: [(mime: String, base64: String)])
+    private static let idleExit = 3.0        // our claude quits this long after its turn
+    private static let ackWait = 10.0        // the Claude app takes a message within this, or it comes back
+    private static let quietWait = 20.0      // an app turn with nothing new on file this long: maybe a permission prompt
+    private static let newChatWait = 180.0   // how long to look for the chat the app's new-chat page starts
+    private static let maxNewChatText = 12_000  // the app's link cuts the message at about 14,000 characters
+    private static let lostWait = 10.0       // a message the mod took, with the chat idle this long and no answer: lost
+
+    /// Our claude runs a turn, or a message waits for one.
+    private var ownRunning: Bool { process != nil && (turn || pending.contains { $0.state == "queued" && !$0.app }) }
+    /// The Claude app runs a turn in this chat.
+    private var appBusy: Bool { lease?.busy == true }
+    /// Either: the busy dot, Stop, "Working…".
+    private var running: Bool { ownRunning || appBusy }
+    /// A new chat whose first message goes to the Claude app's new-chat page: its mode and model are picked there.
+    private var startsInApp: Bool {
+        newChat != nil || (session == nil && !hasFile && process == nil && ClaudeSync.isOn && ClaudeApp.isInstalled)
+    }
 
     init(session: String?, folder: String, title: String?, mode: String?, model: String?) {
         self.session = session.flatMap { $0.isEmpty ? nil : $0 }
@@ -135,9 +191,14 @@ import WebKit
                 wantFile = s  // a new chat whose first message never reached a file
             }
             checkLive()
+            checkLease()
+            if ChatIndex.shared.isAppCurrent(s) { appCurrent = s }
         }
         timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
+        }
+        syncObserver = NotificationCenter.default.addObserver(forName: .stickyClaudeSync, object: nil, queue: .main) {
+            [weak self] _ in MainActor.assumeIsolated { self?.syncTurned() }
         }
         sync()
     }
@@ -160,6 +221,12 @@ import WebKit
         watcher = nil
         timer?.invalidate()
         timer = nil
+        ackTimer?.invalidate()
+        ackTimer = nil
+        newChatTimer?.invalidate()
+        newChatTimer = nil
+        if let o = syncObserver { NotificationCenter.default.removeObserver(o) }
+        syncObserver = nil
         [syncWork, flushWork, idleWork].forEach { $0?.cancel() }
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "sticky", contentWorld: .page)
         webView.navigationDelegate = nil
@@ -210,6 +277,10 @@ import WebKit
             snap = b
         }
         if let s = snap {
+            if s.items.count != items.count || s.items.last?.id != items.last?.id {
+                itemsAt = ProcessInfo.processInfo.systemUptime
+                if appQuiet { appQuiet = false; render(.status) }
+            }
             items = s.items
             counts = s.counts
             meta = s.meta
@@ -282,16 +353,25 @@ import WebKit
         syncSoon(0)
     }
 
-    /// Every 1.5 s: catch what the watcher missed while it's on screen or a turn runs; every 3 s, who else has it open.
+    /// Every 1.5 s: catch what the watcher missed while it's on screen or a turn runs, and whether the mod has it open;
+    /// every 3 s, who else has it open.
     private func tick() {
         guard !closed else { return }
         ticks += 1
         let visible = onScreen
-        if visible || running {
+        if visible || running || !sends.isEmpty {
             if watcher == nil { rewatch() }
             sync()
         }
+        checkLease()
         if visible, ticks % 2 == 0 { checkLive() }
+        if visible, ticks % 3 == 0 { checkMoved() }
+        // A turn in the Claude app with nothing new on file for a while may be waiting on a permission prompt there.
+        let quiet = appTurnSince.map { ProcessInfo.processInfo.systemUptime - max($0, itemsAt) >= Self.quietWait } ?? false
+        if quiet != appQuiet {
+            appQuiet = quiet
+            render(.status)
+        }
         // A rename in the Claude app reaches ChatIndex on its next refresh: one every 2 minutes while a chat shows.
         let now = ProcessInfo.processInfo.systemUptime
         if visible, now - Self.indexRefreshed > 120 {
@@ -317,12 +397,64 @@ import WebKit
                 MainActor.assumeIsolated {
                     guard let self else { return }
                     self.checkingLive = false
-                    guard id == self.session, (l == nil) != (self.live == nil) || l?.busy != self.live?.busy else { return }
-                    self.live = l
-                    self.render(.status)
+                    guard id == self.session else { return }
+                    self.setLive(l)
                 }
             }
         }
+    }
+
+    private func setLive(_ l: LiveSession?) {
+        guard (l == nil) != (live == nil) || l?.busy != live?.busy || l?.entrypoint != live?.entrypoint else { return }
+        live = l
+        render(.status)
+    }
+
+    /// Whether the mod has this chat open (its lease), read off the main thread.
+    private func checkLease() {
+        guard let id = session, !checkingLease else { return }
+        checkingLease = true
+        leaseSeq += 1
+        let seq = leaseSeq
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let l = ClaudeBridge.lease(id)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.checkingLease = false
+                    guard id == self.session, seq == self.leaseSeq else { return }
+                    self.setLease(l)
+                }
+            }
+        }
+    }
+
+    /// A lease counts with sync on, for the Claude app's chats and terminal ones.
+    private func setLease(_ raw: BridgeLease?) {
+        rawLease = raw.flatMap { $0.isChatHost ? $0 : nil }
+        let l = rawLease.flatMap { ClaudeSync.isOn ? $0 : nil }
+        let was = lease
+        lease = l
+        if l?.busy == true {
+            if appTurnSince == nil { appTurnSince = ProcessInfo.processInfo.systemUptime }
+        } else {
+            appTurnSince = nil
+        }
+        guard (l == nil) != (was == nil) || l?.state != was?.state || l?.entrypoint != was?.entrypoint
+            || l?.canInterrupt != was?.canInterrupt else { return }
+        if was?.busy == true, l?.busy != true { syncSoon(0) }  // its turn ended: the last rows, now
+        // Messages that wait for the app's turn to end show as queued.
+        for k in pending.indices where pending[k].app && !pending[k].started && sends[pending[k].id] != nil {
+            pending[k].state = l?.busy == true ? "queued" : "sending"
+        }
+        render(.pending, .status)
+    }
+
+    /// Sync with Claude App was turned on or off: leases count, or stop counting.
+    private func syncTurned() {
+        setLease(rawLease)
+        checkLease()
+        render(.status)
     }
 
     /// After a sync: sent messages that are now on file go, and so do live blocks that are rows now.
@@ -451,19 +583,83 @@ import WebKit
         let f = folder
         var s: [String: Any] = [
             "title": title, "folder": f, "running": running,
-            "busyElsewhere": live?.busy == true, "liveElsewhere": live != nil, "trustWait": trustCard != nil,
+            "busyElsewhere": lease == nil && live?.busy == true, "liveElsewhere": false, "trustWait": trustCard != nil,
             "mode": mode, "modes": Self.modes,
             "models": Self.models.map { ["value": $0.value, "label": $0.label] },
             "loading": loading,
         ]
         if let b = meta.branch { s["branch"] = b }
-        if process == nil, !Self.isFolder(f) { s["readOnly"] = "This chat's folder is gone" }
-        if let e = error { s["error"] = e }
+        if process == nil, lease == nil, !Self.isFolder(f) { s["readOnly"] = "This chat's folder is gone" }
+        if let e = error {
+            s["error"] = e
+            if !errorActions.isEmpty { s["errorActions"] = errorActions.compactMap(Self.action) }
+        }
         if let n = notice { s["notice"] = n }
-        if let m = model ?? meta.lastModel { s["model"] = m }
+        if let m = (lease != nil ? meta.lastModel : nil) ?? model ?? meta.lastModel { s["model"] = m }
         if let c = cost { s["cost"] = c }
         if items.isEmpty { s["empty"] = hasFile ? "No messages yet" : "New chat in \((f as NSString).lastPathComponent)" }
+        if let l = lease {
+            // Route 1: the chat runs in the Claude app (or a terminal); its mode, model and permission prompts are there.
+            let app = l.entrypoint == "claude-desktop"
+            s["locked"] = app ? "Set in the Claude app" : "Set in the terminal where this chat is open"
+            if !l.canInterrupt { s["stopOff"] = app ? "Stop this reply in the Claude app" : "Stop this reply in its terminal" }
+            if appQuiet {
+                s["banner"] = ["icon": "info", "actions": app ? [Self.action("openInClaude")].compactMap { $0 } : [],
+                               "text": app ? "Nothing new for 20 seconds. If Claude asked for permission, answer it in the Claude app."
+                                           : "Nothing new for 20 seconds. If Claude asked for permission, answer it in its terminal."]
+            }
+        } else if let lv = live {
+            s["banner"] = heldBanner(lv)
+        } else if movedTo != nil {
+            s["banner"] = ["icon": "app", "text": "This chat went on in the Claude app, after a rewind or /clear there",
+                           "sub": "Sending here adds to the part before that, which the app no longer shows.",
+                           "actions": ["openInClaude", "sendAnyway"].compactMap(Self.action)]
+        }
+        if lease == nil, startsInApp { s["locked"] = "Pick them on the Claude app's new-chat page" }
+        if newChat != nil {
+            s["banner"] = ["icon": "app", "text": "Finish in the Claude app: confirm the folder and press Return",
+                           "actions": ["cancelNewChat", "startHere"].compactMap(Self.action)]
+        }
         return s
+    }
+
+    /// Route 2: another Claude has the chat open, without Sticky's mod. Nothing is sent there; these are the ways on.
+    private func heldBanner(_ lv: LiveSession) -> [String: Any] {
+        let app = lv.entrypoint == "claude-desktop"
+        var text = app ? "The Claude app has this chat open" : "Another Claude (a terminal, say) has this chat open"
+        if lv.busy { text += " and is working on it" }
+        var acts = app ? ["openInClaude", "sendCopy"] : ["sendCopy"]
+        var b: [String: Any] = ["icon": lv.busy ? "spin" : "app", "text": text]
+        if app || lv.entrypoint == "cli" {
+            if !ClaudeSync.isOn {
+                if ClaudeApp.isInstalled { acts.append("turnOnSync") }
+            } else {
+                // Its claude started before the mod was installed: only a new process loads it (sending from the app
+                // doesn't restart it).
+                b["sub"] = app
+                    ? "It was open before sync was on, so it doesn't have Sticky's mod yet. Quitting and reopening the Claude app should load it."
+                    : "That claude started before sync was on, so it doesn't have Sticky's mod. Quit it and resume the chat there to sync."
+            }
+        }
+        b["actions"] = acts.compactMap(Self.action)
+        return b
+    }
+
+    /// A banner button. The page runs sendCopy, sendHere, sendAnyway and restartSend/restartCopy itself (they need the
+    /// composer); the rest come back here.
+    private static func action(_ id: String) -> [String: Any]? {
+        switch id {
+        case "openInClaude": return ["id": id, "label": "Open in Claude"]
+        case "sendCopy": return ["id": id, "label": "Send as a copy"]
+        case "sendHere": return ["id": id, "label": "Start it here"]
+        case "sendAnyway": return ["id": id, "label": "Send here anyway"]
+        case "restartSend", "restartCopy": return ["id": id, "label": "Restart and send", "pri": true]
+        case "dismissError": return ["id": id, "label": "Cancel"]
+        case "turnOnSync": return ["id": id, "label": "Turn on Sync with Claude App"]
+        case "cancelNewChat": return ["id": id, "label": "Cancel"]
+        case "startHere": return ["id": id, "label": "Start here instead", "pri": true]
+        default: return nil
+        }
     }
 
     // MARK: Messages from the page
@@ -484,13 +680,18 @@ import WebKit
                       let d = i["data"] as? String, !d.isEmpty else { return nil }
                 return (m, d)
             }
-            if let e = send(Self.valid(b["text"] as? String ?? ""), images) {
-                reply(["ok": false, "error": e], nil)
+            let copy = b["copy"] as? Bool == true, here = b["here"] as? Bool == true, again = b["restart"] as? Bool == true
+            if let e = send(Self.valid(b["text"] as? String ?? ""), images, copy: copy, here: here, restart: again) {
+                // "": a banner says why already, so the page only puts the message back.
+                reply(e.isEmpty ? ["ok": false, "quiet": true] : ["ok": false, "error": e], nil)
             } else {
                 reply(["ok": true], nil)
             }
         case "stop":
-            process?.interrupt()
+            stopReply()
+            reply(nil, nil)
+        case "action":
+            act(b["id"] as? String ?? "")
             reply(nil, nil)
         case "answer":
             answer(b)
@@ -525,39 +726,127 @@ import WebKit
         }
     }
 
-    /// Sends a message, starting claude first if it isn't running. Returns why it couldn't, or nil.
-    private func send(_ text: String, _ images: [(mime: String, base64: String)]) -> String? {
+    /// Sends a message the way that fits right now (see the top of this file). Returns why it couldn't, or nil;
+    /// "" when a banner says why already. `copy`: the banner's Send as a copy. `here`: never via the Claude app's
+    /// new-chat page, and not after the app chat's newer part either (Send here anyway). `restart`: Restart and send
+    /// (our claude may be stopped although it runs background tasks).
+    private func send(_ text: String, _ images: [(mime: String, base64: String)], copy wantCopy: Bool = false,
+                      here: Bool = false, restart again: Bool = false, followed: Bool = false) -> String? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !images.isEmpty else { return "There's nothing to send." }
-        if let p = process, !stopping, let s = session {
-            // Another Claude may have opened this chat since ours started, or written to it and gone. Ours must not
-            // write on into the same file: start again (as a copy if the other one is still there).
-            let other = ChatIndex.liveSessions(ignoring: ClaudeProcess.runningPids())[s] != nil
-            if other, running {
-                return "This chat is open in another Claude too. Wait for this reply, then send to continue in a copy."
+        if newChat != nil {
+            // The "Finish in the Claude app" banner says why, and keeps its buttons.
+            post(["op": "nudge"])
+            return ""
+        }
+        let copy = wantCopy && session != nil
+        if let s = session, !copy {
+            // 1. Open in the Claude app (or a terminal claude) with Sticky's mod: it runs there.
+            leaseSeq += 1  // a read already on its way is older than this one
+            setLease(ClaudeBridge.lease(s))
+            if let l = lease { return sendToApp(text, trimmed, images, s, l) }
+            // 2. Open in another Claude without the mod: nothing is written next to it. The banner says what you can do.
+            let other = ChatIndex.liveSessions(ignoring: ClaudeProcess.runningPids())[s]
+            setLive(other)
+            if other != nil {
+                error = nil  // an older error would hide the banner and its buttons
+                errorActions = []
+                post(["op": "nudge"])
+                render(.status)
+                return ""
             }
-            let wrote = bgTasks == 0 && ourTail != nil && items.last?.id != ourTail
-            if !running, other || wrote {
+            // The Claude app chat went on under another id (a rewind or /clear there): follow it, or ask.
+            if here {
+                stayHere = s
+                movedTo = nil
+            } else if !followed, stayHere != s, let c = movedNow(s) {
+                if Self.isOpen(c) {
+                    follow(c)
+                    return send(text, images, restart: again, followed: true)
+                }
+                movedTo = c
+                error = nil
+                errorActions = []
+                post(["op": "nudge"])
+                render(.status)
+                return ""
+            }
+        }
+        if copy, ownRunning { return "Wait for this reply to end, then send it as a copy." }
+        // A new chat starts in the Claude app (with sync on), so it's in the app's list too. Its link carries text only.
+        if session == nil, !hasFile, !copy, !here {
+            if images.isEmpty {
+                if startInApp(trimmed) { return nil }
+            } else if ClaudeSync.isOn, ClaudeApp.isInstalled {
+                startNotice = "Images can't go to the Claude app's new-chat page, so this chat started here."
+            }
+        }
+        // 3. Nothing else has it open: Sticky's own claude.
+        if let p = process, !stopping {
+            // Another Claude may have written to it and gone since our turn, or this goes as a copy: start again.
+            let wrote = ourTail != nil && items.last?.id != ourTail
+            if !ownRunning, wrote || copy {
+                if bgTasks > 0, !again {
+                    // Stopping our claude ends its background tasks (a dev server, say): ask first.
+                    let n = bgTasks
+                    error = (wrote ? "Another Claude added to this chat since Sticky's last reply. " : "")
+                        + "Sending restarts Sticky's claude, which ends its \(n) background task\(n == 1 ? "" : "s")."
+                    errorActions = [copy ? "restartCopy" : "restartSend", "dismissError"]
+                    post(["op": "nudge"])
+                    render(.status)
+                    return ""
+                }
                 stopping = true
                 p.stop()
             }
         }
-        if process == nil || stopping {
+        // Our claude is still quitting. Until it's gone the file may not say where the chat ends: wait for it.
+        if process != nil, stopping { return waitForExit((Self.newId(), text, images), trimmed, copy: copy) }
+        if process == nil {
             // Claude Code skips its "Do you trust this folder?" question in this mode, so it's asked here first.
-            if trustCard != nil || (Self.isFolder(folder) && !folderTrusted()) { return hold(text, trimmed, images) }
-            if let e = startProcess(firstText: trimmed) { return e }
+            if trustCard != nil || (Self.isFolder(folder) && !folderTrusted()) { return hold(text, trimmed, images, copy: copy) }
+            if let e = startProcess(firstText: trimmed, copy: copy) { return e }
         }
         guard let p = process else { return "Claude isn't running." }
         dispatch(p, (Self.newId(), text, images), trimmed)
         return nil
     }
 
-    /// Hands a message to claude; its bubble shows until the file has it.
-    private func dispatch(_ p: ClaudeProcess, _ m: (uuid: String, text: String, images: [(mime: String, base64: String)]),
-                          _ trimmed: String) {
+    /// Keeps a message until our quitting claude is gone; then a new one starts and takes it.
+    private func waitForExit(_ m: Outgoing, _ trimmed: String, copy: Bool) -> String? {
+        pending.append(PendingMessage(
+            id: m.uuid, text: trimmed, images: m.images.map { "data:\($0.mime);base64,\($0.base64)" },
+            state: "queued", known: Set(items.lazy.filter { $0.kind == "user" }.map(\.id))))
+        restart.append(m)
+        if copy { restartCopy = true }
         error = nil
+        render(.pending, .status)
+        return nil
+    }
+
+    /// Our claude is gone: start it again for what was sent meanwhile.
+    private func restartAfterExit() {
+        let msgs = restart, copy = restartCopy
+        restart = []
+        restartCopy = false
+        let first = msgs.first?.text.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if let e = startProcess(firstText: first, copy: copy) {
+            if !e.isEmpty { error = e }
+            for m in msgs { if let k = pending.firstIndex(where: { $0.id == m.uuid }) { cancel(k) } }  // back in the box
+        } else if let p = process {
+            for m in msgs where pending.contains(where: { $0.id == m.uuid }) {
+                dispatch(p, m, m.text.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+        }
+        render(.pending, .status)
+    }
+
+    /// Hands a message to claude; its bubble shows until the file has it.
+    private func dispatch(_ p: ClaudeProcess, _ m: Outgoing, _ trimmed: String) {
+        error = nil
+        errorActions = []
         idleWork?.cancel()
-        let state = running ? "queued" : "sending"
+        let state = ownRunning ? "queued" : "sending"
         if let k = pending.firstIndex(where: { $0.id == m.uuid }) {
             pending[k].state = state
         } else {
@@ -580,12 +869,13 @@ import WebKit
     }
 
     /// Keeps a message until "Trust this folder?" is answered.
-    private func hold(_ text: String, _ trimmed: String, _ images: [(mime: String, base64: String)]) -> String? {
+    private func hold(_ text: String, _ trimmed: String, _ images: [(mime: String, base64: String)], copy: Bool) -> String? {
         let uuid = Self.newId()
         pending.append(PendingMessage(
             id: uuid, text: trimmed, images: images.map { "data:\($0.mime);base64,\($0.base64)" },
             state: "queued", known: Set(items.lazy.filter { $0.kind == "user" }.map(\.id))))
         held.append((uuid, text, images))
+        if copy { heldCopy = true }
         if trustCard == nil {
             let name = (folder as NSString).abbreviatingWithTildeInPath
             trustCard = PermCard(id: Self.trustId, input: [:], js: [
@@ -604,17 +894,25 @@ import WebKit
     /// "Trust this folder?" answered: start claude and send what waited, or give the messages back.
     private func trustAnswered(_ yes: Bool) {
         trustCard = nil
-        let msgs = held
+        let msgs = held, copy = heldCopy
         held = []
+        heldCopy = false
         var started = false
         if yes {
             ChatIndex.trust(folder)
             trustedFolder = folder
             let first = msgs.first?.text.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if process != nil && !stopping {
+            if process != nil, stopping {
+                // Our claude is still quitting: they go once it's gone.
+                restart += msgs
+                if copy { restartCopy = true }
+                render(.pending, .perms, .status)
+                return
+            }
+            if process != nil {
                 started = true
-            } else if let e = startProcess(firstText: first) {
-                error = e
+            } else if let e = startProcess(firstText: first, copy: copy) {
+                if !e.isEmpty { error = e }
             } else {
                 started = true
             }
@@ -626,12 +924,14 @@ import WebKit
             }
         } else {
             for m in msgs { if let k = pending.firstIndex(where: { $0.id == m.uuid }) { cancel(k) } }  // back in the box
+            startNotice = nil
         }
         render(.pending, .perms, .status)
     }
 
-    /// Starts claude for this chat: continues it, continues a copy (another Claude has it open), or starts it new.
-    private func startProcess(firstText: String) -> String? {
+    /// Starts claude for this chat: continues it, continues a copy (`copy`: Send as a copy), or starts it new.
+    /// Returns why not, or nil; "" when another Claude has opened it since (the banner says so).
+    private func startProcess(firstText: String, copy: Bool = false) -> String? {
         let cwd = folder
         guard Self.isFolder(cwd) else {
             render(.status)
@@ -643,15 +943,19 @@ import WebKit
         var forkNotice: String?
         let shownId = transcript.map { Self.stem($0.path) }
         if let s = session, s == shownId || ChatIndex.findFile(s) != nil {
-            if ChatIndex.liveSessions(ignoring: ClaudeProcess.runningPids())[s] != nil {
-                // Two claudes writing one chat would tangle it.
+            if copy {
+                // Send as a copy: the other Claude keeps the chat, and this sticky goes on in a copy of it.
                 let id = Self.newId()
                 o.resume = s
                 o.fork = true
                 o.sessionId = id
                 newId = id
                 ownTitle = title
-                forkNotice = "This chat is open in another Claude (the app or a terminal), so Sticky continued it as a copy."
+                forkNotice = "Sent as a copy. The other Claude keeps the original chat; this sticky shows the copy now."
+            } else if let other = ChatIndex.liveSessions(ignoring: ClaudeProcess.runningPids())[s] {
+                // Opened in another Claude since: two claudes writing one chat would tangle it.
+                setLive(other)
+                return ""
             } else {
                 o.resume = s
             }
@@ -673,6 +977,8 @@ import WebKit
         o.mode = mode
         o.model = model ?? meta.lastModel
         o.effort = meta.lastEffort
+        o.allowedTools = grantRules  // "Always allow … in this chat" outlives each claude (it quits after every reply)
+        o.addDirs = grantDirs
 
         gen += 1
         let g = gen
@@ -692,7 +998,8 @@ import WebKit
         bgTasks = 0
         ourTail = nil
         tailAfter = nil
-        notice = forkNotice
+        notice = forkNotice ?? startNotice
+        startNotice = nil
         if let id = newId {
             ChatIndex.shared.markOwn(id, title: ownTitle, cwd: cwd)  // Sticky's chats are "sdk-cli": list them anyway
             setSession(id)
@@ -707,6 +1014,13 @@ import WebKit
         if changed {
             onSession?(id)
             live = nil
+            lease = nil
+            rawLease = nil
+            appTurnSince = nil
+            movedTo = nil
+            moveStat = nil
+            if ChatIndex.shared.isAppCurrent(id) { appCurrent = id }
+            checkLease()
         }
         if transcript.map({ Self.stem($0.path) }) != id {
             wantFile = id
@@ -739,7 +1053,8 @@ import WebKit
     }
 
     private func setMode(_ v: String) {
-        guard Self.safeModes.contains(v) else { render(.status); return }
+        // An app chat's is set there, and so is that of a new chat that starts on the app's new-chat page.
+        guard Self.safeModes.contains(v), lease == nil, !startsInApp else { render(.status); return }
         mode = v
         process?.setMode(v)
         onSettings?(mode, model)
@@ -747,11 +1062,425 @@ import WebKit
     }
 
     private func setModel(_ v: String) {
-        guard !v.isEmpty else { return }
+        guard !v.isEmpty, lease == nil, !startsInApp else { render(.status); return }
         model = v
         process?.setModel(v)
         onSettings?(mode, model)
         render(.status)
+    }
+
+    // MARK: The Claude app
+
+    /// Route 1: leaves the message for the mod in the chat's outbox. Its bubble shows until the file has it (or
+    /// the mod says no, or nothing takes it in 10 s: then it comes back to the composer).
+    private func sendToApp(_ text: String, _ trimmed: String, _ images: [(mime: String, base64: String)], _ s: String,
+                           _ l: BridgeLease) -> String? {
+        guard images.isEmpty else {
+            return "Images can't go to the Claude app from Sticky. Send the text here, and add the images in the Claude app."
+        }
+        if ownRunning { return "Wait for this reply to end, then send." }  // ours still runs a turn in this chat
+        let id = Self.newId()
+        do {
+            try ClaudeBridge.post(session: s, id: id, kind: "prompt", text: text)
+        } catch let e {
+            return e.localizedDescription
+        }
+        if let p = process, !stopping {  // idle (the app has the chat now): it must not write on
+            if bgTasks > 0 {
+                notice = "Sticky's claude stopped so the Claude app's chat could take your message. That ended its "
+                    + "\(bgTasks) background task\(bgTasks == 1 ? "" : "s")."
+            }
+            stopping = true
+            p.stop()
+        }
+        error = nil
+        errorActions = []
+        pending.append(PendingMessage(
+            id: id, text: trimmed, images: [], state: l.busy ? "queued" : "sending",
+            known: Set(items.lazy.filter { $0.kind == "user" }.map(\.id)), app: true))
+        sends[id] = BridgeSend(id: id, session: s, kind: "prompt", at: ProcessInfo.processInfo.systemUptime)
+        watchAcks()
+        render(.pending, .status)
+        return nil
+    }
+
+    private func watchAcks() {
+        guard ackTimer == nil, !sends.isEmpty else { return }
+        ackTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkAcks() }
+        }
+    }
+
+    /// Every 0.25 s while messages are out: their acks, their claims, and the ones nothing took.
+    private func checkAcks() {
+        guard !closed else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        // A message the mod took may still run with sync off, or while its lease is late: only a chat no process has
+        // open any more counts as gone (the registry, read off the main thread).
+        if rawLease == nil, !sends.isEmpty { checkLive() }
+        for id in Array(sends.keys) {
+            guard var x = sends[id] else { continue }
+            if let a = ClaudeBridge.ack(id) {
+                ClaudeBridge.finish(session: x.session, id: id)
+                sends[id] = nil
+                acked(x, a)
+                continue
+            }
+            if !x.claimed, ClaudeBridge.isClaimed(session: x.session, id: id) { x.claimed = true }
+            if rawLease == nil, live == nil { x.goneAt = x.goneAt ?? now } else { x.goneAt = nil }
+            var lost = false
+            if x.claimed, let l = rawLease {
+                // Taken, and then no answer: the mod's load may have been replaced before it sent it (a reload of the
+                // Claude app's plugins drops what it was doing). Lost once the chat is idle and stays so, or another
+                // load holds the chat, for a while.
+                if x.claimers.isEmpty { x.claimers = Set(ClaudeBridge.claimers(session: x.session, id: id)) }
+                let idle = !l.busy
+                x.idleSince = idle ? (x.idleSince ?? now) : nil
+                let other = idle && !x.claimers.isEmpty && !x.claimers.contains(l.loadId)
+                x.otherSince = other ? (x.otherSince ?? now) : nil
+                lost = (x.otherSince.map { now - $0 >= 5 } ?? false) || (x.idleSince.map { now - $0 >= Self.lostWait } ?? false)
+            } else {
+                x.idleSince = nil
+                x.otherSince = nil
+            }
+            sends[id] = x
+            if lost {
+                ClaudeBridge.finish(session: x.session, id: id)  // its file gone: no load sends it later
+                sends[id] = nil
+                if x.kind == "prompt" {
+                    failed(x, "The Claude app reloaded before sending this. Check the chat before resending.")
+                } else {
+                    checkLease()
+                }
+                continue
+            }
+            guard now - x.at >= Self.ackWait else { continue }
+            if !x.claimed {
+                // Nothing took it in 10 s: take it back (unless the mod claims it this very moment).
+                ClaudeBridge.withdraw(session: x.session, id: id)
+                if ClaudeBridge.isClaimed(session: x.session, id: id) {
+                    // Claimed just now: with its file gone the mod won't run it, and its ack says so.
+                    sends[id]?.claimed = true
+                    sends[id]?.withdrawn = "timeout"
+                    continue
+                }
+                ClaudeBridge.finish(session: x.session, id: id)
+                sends[id] = nil
+                failed(x, x.kind == "prompt" ? "The Claude app didn't take it." : "The Claude app didn't stop the reply.")
+            } else if let g = x.goneAt, now - g >= 5 {
+                // Taken, but the chat closed there before it said it ran it (a message it ran is on file by now).
+                ClaudeBridge.finish(session: x.session, id: id)
+                sends[id] = nil
+                failed(x, "The Claude app closed this chat before it sent your message.")
+            }
+        }
+        if sends.isEmpty {
+            ackTimer?.invalidate()
+            ackTimer = nil
+        }
+    }
+
+    private func acked(_ x: BridgeSend, _ a: BridgeAck) {
+        guard a.ok else {
+            if x.withdrawn == "stop", x.kind == "prompt" {
+                // Stop took it back: it comes back to the composer, like the ones the mod hadn't claimed.
+                if let k = pending.firstIndex(where: { $0.id == x.id }) { cancel(k) }
+                render(.pending, .status)
+                return
+            }
+            if x.withdrawn == "timeout" {
+                failed(x, x.kind == "prompt" ? "The Claude app didn't take it." : "The Claude app didn't stop the reply.")
+                return
+            }
+            failed(x, (x.kind == "prompt" ? "The Claude app didn't take it" : "The Claude app didn't stop the reply")
+                + (a.error.map { ": " + Self.oneLine($0, 200) } ?? "."))
+            return
+        }
+        if x.kind == "interrupt" {
+            checkLease()  // stopped (or nothing was running): the lease says idle by now
+            return
+        }
+        guard let k = pending.firstIndex(where: { $0.id == x.id }) else { return }
+        // Its turn started there: the bubble goes when the file has it (5 s at the latest).
+        pending[k].started = true
+        pending[k].state = "sending"
+        doneSoon(x.id)
+        syncSoon(0)
+        render(.pending, .status)
+    }
+
+    /// A message the Claude app didn't run goes back in the composer, with why and Open in Claude.
+    private func failed(_ x: BridgeSend, _ why: String) {
+        if x.kind == "prompt" {
+            guard let k = pending.firstIndex(where: { $0.id == x.id }) else { return }  // on file after all
+            cancel(k)
+        }
+        error = why
+        errorActions = lease?.entrypoint == "cli" ? [] : ["openInClaude"]
+        render(.pending, .status)
+    }
+
+    /// Whether another Claude has this chat now, or has written to it since our claude's last turn (read now).
+    private func otherHas(_ s: String) -> Bool {
+        if Self.isOpen(s, ignoring: ClaudeProcess.runningPids()) { return true }
+        return ourTail != nil && items.last?.id != ourTail
+    }
+
+    /// Whether a Claude has chat `id` open: the mod's lease (sync on or not), or the session registry.
+    nonisolated private static func isOpen(_ id: String, ignoring ours: Set<Int32>) -> Bool {
+        ClaudeBridge.lease(id)?.isChatHost == true || ChatIndex.liveSessions(ignoring: ours)[id] != nil
+    }
+
+    private static func isOpen(_ id: String) -> Bool { isOpen(id, ignoring: ClaudeProcess.runningPids()) }
+
+    // MARK: The app chat went on under another id
+
+    /// The id the Claude app chat goes on under now, if `s` was its current part and isn't any more (a rewind or
+    /// /clear in the app made a new file), read now. nil if it hasn't moved, or `s` was only ever an earlier part.
+    private func movedNow(_ s: String) -> String? {
+        guard !ownRunning, let path = ChatIndex.shared.appChatFile(s) else { return nil }
+        if ChatIndex.shared.isAppCurrent(s) { appCurrent = s }
+        guard let r = ChatIndex.appPartNow(path: path, last: moveStat) else { return nil }
+        moveStat = r
+        return movedId(s, r)
+    }
+
+    private func movedId(_ s: String, _ r: AppPart) -> String? {
+        guard let c = r.cli, !c.isEmpty else { return nil }
+        if c == s {
+            appCurrent = s
+            return nil
+        }
+        guard appCurrent == s, r.prior.contains(s) else { return nil }
+        return c
+    }
+
+    /// Every 4.5 s while the sticky shows: has the Claude app chat gone on under another id? If a Claude has that one
+    /// open, the sticky follows it; else a banner asks (Open in Claude, Send here anyway).
+    private func checkMoved() {
+        guard let s = session, !checkingMove, lease == nil, live == nil, process == nil, stayHere != s,
+              let path = ChatIndex.shared.appChatFile(s) else { return }
+        if ChatIndex.shared.isAppCurrent(s) { appCurrent = s }
+        guard appCurrent == s else { return }
+        checkingMove = true
+        let last = moveStat, ours = ClaudeProcess.runningPids()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let r = ChatIndex.appPartNow(path: path, last: last)
+            let open = r?.cli.map { $0 != s && Self.isOpen($0, ignoring: ours) } ?? false
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.checkingMove = false
+                    guard s == self.session, let r else { return }
+                    self.moveStat = r
+                    guard let c = self.movedId(s, r) else {
+                        if self.movedTo != nil { self.movedTo = nil; self.render(.status) }
+                        return
+                    }
+                    if open, self.process == nil {
+                        self.follow(c)
+                    } else if self.movedTo != c {
+                        self.movedTo = c
+                        self.render(.status)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Claude app chat this sticky shows goes on as `c` now: show it, and send to it, from here on.
+    private func follow(_ c: String) {
+        if let p = process, !stopping, !ownRunning {  // it holds the old part
+            stopping = true
+            p.stop()
+        }
+        setSession(c)
+        appCurrent = c
+        notice = "This chat went on in the Claude app (after a rewind or /clear there), so this sticky follows it now."
+        ChatIndex.shared.refresh()
+        checkLive()
+        syncSoon(0)
+        render(.status)
+    }
+
+    /// The bubble goes after the next sync `secs` from now, if the file hasn't shown the message by then.
+    private func doneSoon(_ id: String, _ secs: Double = 5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + secs) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, !self.closed, let k = self.pending.firstIndex(where: { $0.id == id }),
+                      self.pending[k].doneAt == nil else { return }
+                self.pending[k].doneAt = self.syncSeq
+                self.syncSoon(0)
+            }
+        }
+    }
+
+    /// Stop (or Esc): our claude's turn, or the Claude app's (when the mod can stop it). Messages that wait for our
+    /// claude to restart come back to the composer, and so do the ones sent to the app that haven't started.
+    private func stopReply() {
+        if !restart.isEmpty {
+            for m in restart { if let k = pending.firstIndex(where: { $0.id == m.uuid }) { cancel(k) } }
+            restart = []
+            restartCopy = false
+            render(.pending, .status)
+        }
+        if let p = process, ownRunning {
+            p.interrupt()
+            return
+        }
+        guard let s = session else { return }
+        leaseSeq += 1
+        setLease(ClaudeBridge.lease(s))  // the turn running right now, not the one the last tick saw
+        guard let l = lease, l.busy, l.canInterrupt else { return }
+        // Messages the app hasn't started would run right after the stop: they come back instead. One the mod has
+        // taken waits there for the turn to end; with its file gone it isn't sent, and its ack says so.
+        for (id, x) in sends where x.kind == "prompt" {
+            ClaudeBridge.withdraw(session: x.session, id: id)
+            if x.claimed || ClaudeBridge.isClaimed(session: x.session, id: id) {
+                sends[id]?.claimed = true
+                sends[id]?.withdrawn = "stop"
+                continue
+            }
+            ClaudeBridge.finish(session: x.session, id: id)
+            sends[id] = nil
+            if let k = pending.firstIndex(where: { $0.id == id }) { cancel(k) }
+        }
+        let id = Self.newId()
+        do {
+            // It names the turn to stop: if that one has ended by the time the mod reads this, nothing else stops.
+            try ClaudeBridge.post(session: s, id: id, kind: "interrupt", text: "", turnId: l.turnId)
+        } catch let e {
+            error = e.localizedDescription
+            render(.status)
+            return
+        }
+        sends[id] = BridgeSend(id: id, session: s, kind: "interrupt", at: ProcessInfo.processInfo.systemUptime)
+        watchAcks()
+        render(.pending, .status)
+    }
+
+    /// A banner button the page hands back.
+    private func act(_ id: String) {
+        switch id {
+        case "openInClaude": ClaudeApp.openChat(session)
+        case "turnOnSync": onTurnOnSync?()
+        case "dismissError":
+            error = nil
+            errorActions = []
+            render(.status)
+        case "cancelNewChat": cancelNewChat()
+        case "startHere": startHereInstead()
+        default: break
+        }
+    }
+
+    // MARK: A new chat, started in the Claude app
+
+    /// With sync on and the Claude app here: opens claude://code/new with the message and this folder (the app
+    /// comes forward and asks to confirm the folder; nothing is sent until you press Return there), then looks for
+    /// the chat it starts. false: start it here instead (images, a message too long for the link, no app).
+    private func startInApp(_ trimmed: String) -> Bool {
+        guard ClaudeSync.isOn, ClaudeApp.isInstalled, Self.isFolder(folder) else { return false }
+        guard trimmed.utf16.count <= Self.maxNewChatText else {
+            startNotice = "This message is too long for the Claude app's new-chat page, so the chat started here."
+            return false
+        }
+        guard let u = ClaudeApp.newChatURL(text: trimmed, folder: folder) else { return false }
+        let since = Date().timeIntervalSince1970
+        guard ClaudeApp.open(u) else {
+            startNotice = "Couldn't open the Claude app, so the chat started here."
+            return false
+        }
+        let id = Self.newId()
+        error = nil
+        errorActions = []
+        pending.append(PendingMessage(id: id, text: trimmed, images: [], state: "app", known: [], app: true))
+        newChat = NewChatWait(id: id, text: trimmed, folder: folder, since: since,
+                              until: ProcessInfo.processInfo.systemUptime + Self.newChatWait)
+        newChatTimer?.invalidate()
+        newChatTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.lookForNewChat() }
+        }
+        render(.pending, .status)
+        return true
+    }
+
+    /// About every second for 3 minutes: has the Claude app started the chat (that folder, since the link opened,
+    /// that first message)?
+    private func lookForNewChat() {
+        guard let w = newChat, !closed else { return }
+        guard ProcessInfo.processInfo.systemUptime < w.until else { return newChatTimedOut() }
+        guard !findingChat else { return }
+        findingChat = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let hit = ChatIndex.findNewAppChat(folder: w.folder, since: w.since, text: w.text)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.findingChat = false
+                    guard let hit, self.newChat?.id == w.id else { return }
+                    self.bindNewChat(hit.id, w)
+                }
+            }
+        }
+    }
+
+    /// The Claude app started it: this sticky shows that chat from now on (later sends go to the app), and comes
+    /// back to the front with the cursor in its message box.
+    private func bindNewChat(_ id: String, _ w: NewChatWait) {
+        stopWaitingForNewChat()
+        if let k = pending.firstIndex(where: { $0.id == w.id }) {
+            pending[k].state = "sending"
+            pending[k].started = true
+            doneSoon(w.id)
+        }
+        ChatIndex.shared.refresh()  // the app's title and its own id for the chat (Open in Claude)
+        grantRules = []  // another chat: what "Always allow" granted doesn't come along
+        grantDirs = []
+        appCurrent = id
+        setSession(id)
+        checkLive()
+        syncSoon(0)
+        render(.pending, .status)
+        onFront?()
+        focus()
+    }
+
+    private func stopWaitingForNewChat() {
+        newChat = nil
+        newChatTimer?.invalidate()
+        newChatTimer = nil
+    }
+
+    private func newChatTimedOut() {
+        guard let w = newChat else { return }
+        stopWaitingForNewChat()
+        if let k = pending.firstIndex(where: { $0.id == w.id }) { cancel(k) }  // back in the box
+        error = "The Claude app didn't start this chat in 3 minutes. Send it again, or start it here."
+        errorActions = ["sendHere"]
+        render(.pending, .status)
+    }
+
+    /// Cancel: the message comes back to the composer. (The app's new-chat page stays as it is.)
+    private func cancelNewChat() {
+        guard let w = newChat else { return }
+        stopWaitingForNewChat()
+        if let k = pending.firstIndex(where: { $0.id == w.id }) { cancel(k) }
+        render(.pending, .status)
+    }
+
+    /// Start here instead: Sticky's own claude starts the chat with the message (as before sync).
+    private func startHereInstead() {
+        guard let w = newChat else { return }
+        stopWaitingForNewChat()
+        pending.removeAll { $0.id == w.id }
+        if let e = send(w.text, [], here: true) {
+            // Back in the composer.
+            pending.append(PendingMessage(id: Self.newId(), text: w.text, images: [], state: "sending", known: []))
+            cancel(pending.count - 1)
+            if !e.isEmpty { error = e }
+        }
+        render(.pending, .status)
     }
 
     // MARK: Events from claude
@@ -786,14 +1515,27 @@ import WebKit
             scheduleIdle()
         case .turnStarted:
             // Also a turn claude starts by itself (a background task finished): busy, Stop works, no idle stop.
+            let ours = turn || pending.contains { !$0.app && $0.doneAt == nil && $0.state != "cancelled" }
             cliTurn = true
             turn = true
             idleWork?.cancel()
             idleWork = nil
+            if !ours, let p = process, !stopping, let s = session, otherHas(s) {
+                // A turn of its own, while another Claude has the chat (or has written to it since our last turn):
+                // this claude doesn't know what the other wrote, so its reply would go into a side branch. It stops.
+                stopping = true
+                p.stop()
+                notice = "A background task in Sticky's claude finished while another Claude had this chat, so Sticky "
+                    + "stopped its claude before it wrote next to that Claude."
+            }
             render(.status)
         case .backgroundTasks(let n):
             bgTasks = n
-            if n == 0 { scheduleIdle() }  // the 10 minutes start once the last one is done
+            if n == 0 { scheduleIdle() }  // the few seconds start once the last one is done
+        case .granted(let rules, let dirs):
+            // Kept for the chat: the next claude (this one quits after each reply) starts with them.
+            for r in rules where !grantRules.contains(r) { grantRules.append(r) }
+            for d in dirs where !grantDirs.contains(d) { grantDirs.append(d) }
         case .turnEnded(let r):
             turn = false
             cliTurn = false
@@ -835,11 +1577,15 @@ import WebKit
             ghost = []
             ghostEnd = nil
             if let err { error = err }
-            // Messages that never ran won't now. The next send starts claude again.
-            for k in pending.indices where pending[k].doneAt == nil && pending[k].state != "cancelled" {
+            // Messages that never ran won't now. The next send starts claude again. (Not the Claude app's, and not
+            // the ones that waited for this exit: those start it again now.)
+            let waiting = Set(restart.map(\.uuid))
+            for k in pending.indices where pending[k].doneAt == nil && pending[k].state != "cancelled" && !pending[k].app
+                && !waiting.contains(pending[k].id) {
                 if pending[k].started { pending[k].doneAt = syncSeq } else { cancel(k) }
             }
             syncSoon(0)
+            if !restart.isEmpty { restartAfterExit() }
             render(.pending, .ghost, .perms, .status)
         }
     }
@@ -886,22 +1632,23 @@ import WebKit
         }
     }
 
-    /// 10 minutes after a turn ends with no cards, claude stops (not while it runs a background task: stopping would
-    /// end it). The next message starts it again (with --resume).
+    /// A few seconds after a turn ends, with nothing queued and no card open, claude quits (not while it runs a
+    /// background task: quitting would end it; it quits once the last one is done). Quitting writes where the chat
+    /// ends, so whichever Claude opens it next goes on from there. The next message starts it again (--resume).
     private func scheduleIdle() {
         idleWork?.cancel()
         idleWork = nil
-        guard process != nil, !running, cards.isEmpty else { return }
+        guard process != nil, !ownRunning, cards.isEmpty, bgTasks == 0 else { return }
         let w = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
-                guard let self, let p = self.process, !self.running, self.cards.isEmpty else { return }
-                if self.bgTasks > 0 { self.scheduleIdle(); return }
+                guard let self, let p = self.process, !self.stopping, !self.ownRunning, self.cards.isEmpty,
+                      self.bgTasks == 0 else { return }
                 self.stopping = true
                 p.stop()
             }
         }
         idleWork = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + 600, execute: w)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.idleExit, execute: w)
     }
 
     // MARK: Permission cards
@@ -1120,6 +1867,29 @@ private struct ChatSnap {
     }
 }
 
+/// A message handed to the Claude app's chat through the bridge, not answered yet.
+private struct BridgeSend {
+    var id: String
+    var session: String
+    var kind: String           // prompt | interrupt
+    var at: Double             // uptime when it was written
+    var claimed = false        // a load of the mod has it
+    var goneAt: Double?        // uptime since when the chat's lease has been gone, and no process has the chat
+    var withdrawn: String?     // Sticky deleted it after the mod claimed it: "stop" | "timeout" (the mod acks ok:false)
+    var claimers: Set<String> = []  // the loads of the mod that claimed it (from its claim files' names)
+    var idleSince: Double?     // uptime since when the chat has been idle, once claimed
+    var otherSince: Double?    // uptime since when another load than a claimer has held the chat, idle
+}
+
+/// A new chat's first message, on the Claude app's new-chat page.
+private struct NewChatWait {
+    var id: String             // its pending bubble
+    var text: String           // trimmed
+    var folder: String
+    var since: Double          // unix seconds when the link opened
+    var until: Double          // uptime when to give up
+}
+
 /// A message you sent that isn't on file yet.
 private struct PendingMessage {
     var id: String             // the uuid claude reports its lifecycle under
@@ -1129,6 +1899,7 @@ private struct PendingMessage {
     var known: Set<String>     // user items already there when it was sent
     var started = false
     var doneAt: Int?           // claude is done with it: gone once a sync after this one has run
+    var app = false            // handed to the Claude app (the bridge, or its new-chat page), not to our claude
 
     var js: [String: Any] { ["id": id, "text": text, "images": images, "state": state] }
 }

@@ -52,6 +52,9 @@ struct LiveSession { var pid: Int32; var busy: Bool; var entrypoint: String?; va
     private var own: [String: Own] = [:]  // chats Sticky started
     private var index: [String: Int] = [:]  // id → position in `chats`
     private var appTitles: [String: String] = [:]  // jsonl id → the Claude app's title for that chat
+    private var appIds: [String: String] = [:]  // jsonl id → the Claude app's own id for that chat ("local_…")
+    private var appFiles: [String: String] = [:]  // jsonl id (current or earlier part) → the app's session file of its chat
+    private var appCurrentIds: Set<String> = []   // jsonl ids that are an app chat's current part
     private var running = false
     private var again = false
 
@@ -107,6 +110,25 @@ struct LiveSession { var pid: Int32; var busy: Bool; var entrypoint: String?; va
     /// The Claude app's title for this chat (it follows renames there), as last read.
     func appTitle(_ id: String) -> String? { appTitles[id] }
 
+    /// The Claude app's own id for this chat ("local_<id>", its session file's name), as last read. It makes the
+    /// link that opens the chat in the app.
+    func appChatId(_ id: String) -> String? { appIds[id] }
+
+    /// Whether this id is a Claude app chat's current part (not an earlier one), as last read.
+    func isAppCurrent(_ id: String) -> Bool { appCurrentIds.contains(id) }
+
+    /// The Claude app's session file for the chat this id is a part of (current or earlier), as last read.
+    func appChatFile(_ id: String) -> String? { appFiles[id] }
+
+    /// That session file's current part and earlier parts, read now: again only if its size or time changed since
+    /// `last`. (A rewind or /clear in the app changes its current part.)
+    nonisolated static func appPartNow(path: String, last: AppPart?) -> AppPart? {
+        guard let (size, mtime) = Reader.fileInfo(path) else { return nil }
+        if let l = last, l.path == path, l.size == size, abs(l.mtime - mtime) < 1e-6 { return l }
+        guard let f = Reader.deskFile(path, size, mtime) else { return nil }
+        return AppPart(path: path, size: size, mtime: mtime, cli: f.cli, prior: f.prior)
+    }
+
     // MARK: Chats Sticky started
 
     /// A chat Sticky started (the CLI marks those `sdk-cli`): list it anyway, with this title until the file has one.
@@ -145,11 +167,25 @@ struct LiveSession { var pid: Int32; var busy: Bool; var entrypoint: String?; va
     /// Applies the Claude app's titles, archived state and hidden copies, plus Sticky's own chats, to what the files say.
     private func compose() {
         var byCli: [String: DeskFile] = [:]  // the Claude app's entry for each jsonl id (newest activity wins)
-        for f in desk.files.values {
+        var deskIds: [String: String] = [:]  // jsonl id → that entry's file name without ".json" ("local_…")
+        var deskPaths: [String: String] = [:]  // jsonl id → that entry's file
+        for (path, f) in desk.files {
             guard let c = f.cli, !c.isEmpty else { continue }
             if let o = byCli[c], o.active >= f.active { continue }
             byCli[c] = f
+            deskIds[c] = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
+            deskPaths[c] = path
         }
+        // An earlier part of an app chat (before a /clear, say) opens that chat too.
+        for (path, f) in desk.files where f.cli?.isEmpty == false {
+            for p in f.prior where deskIds[p] == nil {
+                deskIds[p] = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
+                deskPaths[p] = path
+            }
+        }
+        appIds = deskIds
+        appFiles = deskPaths
+        appCurrentIds = Set(byCli.keys)
         let ids = Set(files.values.map(\.id))
         let deleted = Set(desk.deleted)
         var byFileId: [String: ChatSummary] = [:]  // id → its file (the newer one if the id is in two folders)
@@ -222,7 +258,7 @@ struct LiveSession { var pid: Int32; var busy: Bool; var entrypoint: String?; va
 
     /// The same prompt, maybe cut at another length (the first one is read from its row, the last one often from a
     /// last-prompt row, and each is cut to 200 characters on its own).
-    private static func samePrompt(_ a: String, _ b: String) -> Bool {
+    private nonisolated static func samePrompt(_ a: String, _ b: String) -> Bool {
         let x = a.hasSuffix("…") ? String(a.dropLast()) : a, y = b.hasSuffix("…") ? String(b.dropLast()) : b
         return x.hasPrefix(y) || y.hasPrefix(x)
     }
@@ -280,6 +316,36 @@ struct LiveSession { var pid: Int32; var busy: Bool; var entrypoint: String?; va
         return out
     }
 
+    // MARK: A new chat the Claude app started
+
+    /// The chat the Claude app started in `folder` since `since` (unix seconds) with `text` as its first prompt, if
+    /// its file is there yet. Reads only that folder's chat files changed since then (head and tail, as the list does).
+    nonisolated static func findNewAppChat(folder: String, since: Double, text: String) -> ChatSummary? {
+        let root = projectsDir.path
+        var best: ChatSummary?
+        for name in Set([encode(standard(folder)), encode(realPath(folder))]) {
+            let dir = root + "/" + name
+            for n in (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [] where n.hasSuffix(".jsonl") {
+                let id = String(n.dropLast(6))
+                let path = dir + "/" + n
+                guard !id.isEmpty, !id.hasPrefix("."), let (size, mtime) = Reader.fileInfo(path), mtime >= since - 5,
+                      let s = Reader.readChat(Found(path: path, id: id, folder: name, size: size, mtime: mtime)),
+                      isNewAppChat(s, folder: folder, since: since, text: text) else { continue }
+                if best.map({ ($0.created ?? 0) > (s.created ?? 0) }) ?? true { best = s }  // the first one started
+            }
+        }
+        return best
+    }
+
+    /// A chat the Claude app started (entrypoint claude-desktop) in `folder`, created since `since` (2 s of slack),
+    /// whose first prompt is `text` (as the list cleans it: one line, 200 characters at most).
+    nonisolated static func isNewAppChat(_ s: ChatSummary, folder: String, since: Double, text: String) -> Bool {
+        guard s.entrypoint == "claude-desktop", (s.created ?? s.mtime) >= since - 2, let cwd = s.cwd,
+              Set([standard(cwd), realPath(cwd)]).contains(where: { $0 == standard(folder) || $0 == realPath(folder) }),
+              let want = Reader.clean(text), !s.firstPrompt.isEmpty else { return false }
+        return samePrompt(s.firstPrompt, want)
+    }
+
     // MARK: Folder trust
 
     /// Whether Claude Code trusts this folder already, the way its own check goes: a projects[<path>]
@@ -330,12 +396,12 @@ struct LiveSession { var pid: Int32; var busy: Bool; var entrypoint: String?; va
         return (try? JSONDecoder().decode([String].self, from: data)) ?? []
     }
 
-    private static func standard(_ p: String) -> String {
+    private nonisolated static func standard(_ p: String) -> String {
         let s = URL(fileURLWithPath: p).standardizedFileURL.path
         return s.count > 1 && s.hasSuffix("/") ? String(s.dropLast()) : s
     }
 
-    private static func realPath(_ p: String) -> String {
+    private nonisolated static func realPath(_ p: String) -> String {
         guard let r = realpath(p, nil) else { return standard(p) }
         defer { free(r) }
         return String(cString: r)
@@ -350,6 +416,15 @@ struct LiveSession { var pid: Int32; var busy: Bool; var entrypoint: String?; va
 }
 
 // MARK: - Cache and stored types
+
+/// A Claude app chat's session file as read at one moment: its current part (cliSessionId) and its earlier ones.
+struct AppPart: Equatable, Sendable {
+    var path: String
+    var size: Int64
+    var mtime: Double
+    var cli: String?
+    var prior: [String]
+}
 
 /// Sticky's own chats: the title to show until the file has one, and when it was started.
 private struct Own: Codable { var title: String?; var cwd: String?; var t: Double }
@@ -640,10 +715,11 @@ private enum Reader {
         return text(m["content"]).flatMap(clean)
     }
 
-    /// No origin (older and sdk rows) or a human one. Not task notifications or messages from other sessions.
+    /// No origin (older and sdk rows), a human one, or a mod's sent as the person's own (Sticky's bridge sends
+    /// that way). Not task notifications or messages from other sessions.
     static func isHuman(_ o: Any?) -> Bool {
         guard let o = o as? [String: Any], let k = o["kind"] as? String else { return true }
-        return k == "human"
+        return k == "human" || (k == "plugin" && o["asUser"] as? Bool == true)
     }
 
     /// The text of a string or a block list; nil if it holds a tool result.

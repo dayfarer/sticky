@@ -14,6 +14,8 @@ final class ClaudeProcess: @unchecked Sendable {
         var mode: String? = nil        // --permission-mode (default | acceptEdits | plan | auto)
         var model: String? = nil       // --model
         var effort: String? = nil      // --effort
+        var allowedTools: [String] = []  // --allowedTools: rules "Always allow … in this chat" granted before a restart
+        var addDirs: [String] = []     // --add-dir: folders granted that way
     }
 
     /// One block of the reply being written now.
@@ -57,6 +59,7 @@ final class ClaudeProcess: @unchecked Sendable {
         case turnStarted                             // system/init: a turn began (ours, or one claude starts itself)
         case turnEnded(TurnResult)
         case backgroundTasks(Int)                    // how many background tasks (shells, agents, monitors) run now
+        case granted(rules: [String], dirs: [String]) // "Always allow … in this chat": rules ("Bash(npm test)") and folders
         case modeChanged(String)
         case modelChanged(String)
         case wrote                                   // a user/assistant/system row went by on stdout: the .jsonl probably grew
@@ -107,7 +110,7 @@ final class ClaudeProcess: @unchecked Sendable {
     }
 
     /// The child environment: this process's env minus CLAUDECODE, CLAUDE_CODE_* (but not the CLAUDE_CODE_DISABLE_* opt-outs
-    /// or CLAUDE_CODE_USE_* provider switches), CLAUDE_AGENT_SDK*, BAGGAGE, TRACEPARENT, TRACESTATE; PATH = the login shell's PATH plus ~/.local/bin, /opt/homebrew/bin, /usr/local/bin; LANG default
+    /// or CLAUDE_CODE_USE_* provider switches), CLAUDE_AGENT_SDK*, BAGGAGE, TRACEPARENT, TRACESTATE, STICKY_BRIDGE_ALLOW_SDK; PATH = the login shell's PATH plus ~/.local/bin, /opt/homebrew/bin, /usr/local/bin; LANG default
     /// en_US.UTF-8. Cached. The first call can block ~1 s: call `warmUp()` at app launch.
     static func environment() -> [String: String] {
         envLock.lock()
@@ -121,8 +124,11 @@ final class ClaudeProcess: @unchecked Sendable {
         var env = ProcessInfo.processInfo.environment.filter { k, _ in
             // Opt-outs and provider switches set for GUI apps (launchctl setenv) still apply.
             if k.hasPrefix("CLAUDE_CODE_DISABLE_") || k.hasPrefix("CLAUDE_CODE_USE_") { return true }
+            // Sticky's mod must sleep in Sticky's own claude. It acts only for CLAUDE_CODE_ENTRYPOINT claude-desktop or
+            // cli, which a Sticky started from a Claude chat would pass on (dropped with the other CLAUDE_CODE_ names),
+            // or with STICKY_BRIDGE_ALLOW_SDK (test harnesses set it for theirs). Its bridge folder isn't claude's business.
             return !(k == "CLAUDECODE" || k.hasPrefix("CLAUDE_CODE_") || k.hasPrefix("CLAUDE_AGENT_SDK")
-              || k == "BAGGAGE" || k == "TRACEPARENT" || k == "TRACESTATE")
+              || k == "BAGGAGE" || k == "TRACEPARENT" || k == "TRACESTATE" || k.hasPrefix("STICKY_BRIDGE_"))
         }
         if (env["LANG"] ?? "").isEmpty { env["LANG"] = "en_US.UTF-8" }
         // Started from Finder or a login item, Sticky only has launchd's bare PATH.
@@ -270,6 +276,12 @@ final class ClaudeProcess: @unchecked Sendable {
         a += ["--permission-mode", m == "default" ? "manual" : m]
         if let m = o.model, !m.isEmpty { a += ["--model", m] }
         if let e = o.effort, efforts.contains(e) { a += ["--effort", e] }
+        // What "Always allow … in this chat" granted before this claude started: each rule and folder its own
+        // argument (never through a shell). Checked on 2.1.325: a rule with a space in it stays one rule.
+        let rules = o.allowedTools.filter { !$0.isEmpty && !$0.hasPrefix("-") && !$0.contains("\n") }
+        if !rules.isEmpty { a += ["--allowedTools"] + rules }
+        let dirs = o.addDirs.filter { $0.hasPrefix("/") && !$0.contains("\n") }
+        if !dirs.isEmpty { a += ["--add-dir"] + dirs }
         return a
     }
 
@@ -394,11 +406,24 @@ final class ClaudeProcess: @unchecked Sendable {
             var body: [String: Any] = ["behavior": "allow"]
             if let u = updatedInput, JSONSerialization.isValidJSONObject(u) { body["updatedInput"] = u }
             var newMode: String?
+            var rules: [String] = [], dirs: [String] = []
             if always, !ups.isEmpty {
                 body["updatedPermissions"] = ups
                 newMode = ups.last { $0["type"] as? String == "setMode" }?["mode"] as? String
+                for u in ups {
+                    switch u["type"] as? String {
+                    case "addRules":
+                        for r in u["rules"] as? [[String: Any]] ?? [] {
+                            guard let t = r["toolName"] as? String, !t.isEmpty else { continue }
+                            rules.append((r["ruleContent"] as? String).map { "\(t)(\($0))" } ?? t)
+                        }
+                    case "addDirectories": dirs += u["directories"] as? [String] ?? []
+                    default: break
+                    }
+                }
             }
             self.reply(id, body)
+            if !rules.isEmpty || !dirs.isEmpty { self.emit(.granted(rules: rules, dirs: dirs)) }
             if let m = newMode {
                 self.mode = m
                 self.emit(.modeChanged(m))
