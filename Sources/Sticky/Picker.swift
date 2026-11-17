@@ -1,4 +1,4 @@
-// A floating search-and-pick list, used for ⌘P (browse notes) and ⌘K (actions).
+// A floating search-and-pick list, used for ⌘P (browse notes), ⌘K (actions), ⌘T (sites) and ⌘O (Claude chats).
 import AppKit
 
 @MainActor final class QuickPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate, NSWindowDelegate {
@@ -7,6 +7,7 @@ import AppKit
         var subtitle: String = ""  // second line (a note's preview); empty = one-line row
         var detail: String = ""
         var searchText: String = ""
+        var key: String? = nil  // what the row is (a chat's id), so the selection can follow it when the list changes
         var run: () -> Void
     }
 
@@ -24,6 +25,9 @@ import AppKit
     /// What's typed right now.
     var query: String { field.stringValue.trimmingCharacters(in: .whitespaces) }
     private weak var returnTo: NSWindow?
+    /// Goes up with each present(), so a late update meant for an earlier list can tell it's too late.
+    private(set) var generation = 0
+    var isOpen: Bool { panel.isVisible }
 
     private override init() {
         super.init()
@@ -90,6 +94,7 @@ import AppKit
 
     func present(placeholder: String, items: [Item], over parent: NSWindow?, extra: ((String) -> Item?)? = nil,
                  rank: ((String) -> [Item])? = nil) {
+        generation += 1
         all = items
         self.extra = extra
         self.rank = rank
@@ -114,6 +119,21 @@ import AppKit
         panel.orderFrontRegardless()
         panel.makeKey()
         panel.makeFirstResponder(field)
+    }
+
+    /// Replaces the list while it's open (the chat list fills in as it refreshes). Keeps what's typed and the selected
+    /// item: a row that moved stays selected (Return must never open another chat); one that's gone leaves the first.
+    func update(items: [Item]) {
+        all = items
+        let row = table.selectedRow
+        let key = row >= 0 && row < shown.count ? shown[row].key : nil
+        refilter()
+        var at = row
+        if let key { at = shown.firstIndex { $0.key == key } ?? 0 }
+        if at > 0, at < shown.count {
+            table.selectRowIndexes([at], byExtendingSelection: false)
+            table.scrollRowToVisible(at)
+        }
     }
 
     /// Debug: saves a PNG of the picker (works even if it isn't the focused window).

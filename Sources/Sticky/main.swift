@@ -1,4 +1,4 @@
-// Sticky — floating always-on-top windows for any terminal command or website.
+// Sticky — floating always-on-top windows for any terminal command, website, note or Claude chat.
 import AppKit
 import Carbon
 import ServiceManagement
@@ -9,7 +9,7 @@ import WebKit
 // MARK: - Saved state
 
 struct StickyConfig: Codable {
-    enum Kind: String, Codable { case terminal, web, note }
+    enum Kind: String, Codable { case terminal, web, note, chat }
     var id = UUID()
     var kind: Kind
     var command: String?
@@ -23,6 +23,11 @@ struct StickyConfig: Codable {
     var stack: UUID?  // stickies with the same stack share one spot, like tabs: one shows, the rest wait behind it
     var used: Double?  // when you last used it, for ⌃Tab order and which sticky in a stack comes back next
     var popup: Bool?  // a sign-in popup a page opened: not saved, gone when the page closes it
+    // Chat stickies (`folder` is the chat's folder, `zoom` the page zoom):
+    var session: String?  // the Claude Code chat's id (~/.claude/projects/*/<id>.jsonl); nil until a new chat's first message
+    var title: String?  // the chat's title, shown until its file is read
+    var chatMode: String?  // permission mode you picked: default | acceptEdits | plan | auto
+    var chatModel: String?  // model you picked
 }
 
 enum Store {
@@ -35,11 +40,23 @@ enum Store {
 
     static func load() -> [StickyConfig] {
         guard let data = try? Data(contentsOf: file) else { return [] }
-        return (try? JSONDecoder().decode([StickyConfig].self, from: data)) ?? []
+        // One sticky this build can't read (a kind from a newer version, say) is skipped, not all of them.
+        return ((try? JSONDecoder().decode([Lossy].self, from: data)) ?? []).compactMap(\.config)
+    }
+
+    private struct Lossy: Decodable {
+        let config: StickyConfig?
+        init(from d: Decoder) throws { config = try? StickyConfig(from: d) }
     }
 
     static func save(_ configs: [StickyConfig]) {
-        if let data = try? JSONEncoder().encode(configs) { try? data.write(to: file) }
+        guard let data = try? JSONEncoder().encode(configs) else { return }
+        try? data.write(to: file)
+        // A build from before chat stickies can't read this file and would save an empty list over it. It never
+        // touches stickies-backup.json, so that keeps the last state saved here.
+        if configs.contains(where: { $0.kind == .chat }) {
+            try? data.write(to: file.deletingLastPathComponent().appendingPathComponent("stickies-backup.json"), options: .atomic)
+        }
     }
 }
 
@@ -93,6 +110,7 @@ final class HoverView: NSView {
     private var web: WKWebView?
     private var titleObserver: NSKeyValueObservation?
     private var note: NoteEditor?
+    private var chat: ChatView?
     private var urlObserver: NSKeyValueObservation?
     private var visitHost: String?
     private var visitNeedsTitle = false
@@ -119,6 +137,8 @@ final class HoverView: NSView {
             panel.setFrame(saved, display: false)
         } else if config.kind == .note {
             panel.setContentSize(config.noteSticky == true ? NSSize(width: 320, height: 340) : NSSize(width: 380, height: 440))
+        } else if config.kind == .chat {
+            panel.setContentSize(NSSize(width: 460, height: 640))
         }
 
         panel.level = .floating
@@ -146,6 +166,7 @@ final class HoverView: NSView {
         case .terminal: setUpTerminal(in: container)
         case .web: setUpWeb(in: container, given: webConfig)
         case .note: setUpNote(in: container)
+        case .chat: setUpChat(in: container)
         }
     }
 
@@ -173,6 +194,58 @@ final class HoverView: NSView {
             args: ["-l", "-i", "-c", script],
             environment: env.map { "\($0.key)=\($0.value)" })
         panel.title = "\(command) — \((folder as NSString).lastPathComponent)"
+    }
+
+    /// A Claude Code chat in a chat page. Claude only starts when you send, and keeps running while hidden.
+    private func setUpChat(in container: NSView) {
+        let folder = config.folder ?? NSHomeDirectory()
+        let c = ChatView(session: config.session, folder: folder, title: config.title,
+                         mode: config.chatMode, model: config.chatModel)
+        let w = c.webView
+        w.frame = container.bounds
+        w.autoresizingMask = [.width, .height]
+        w.pageZoom = config.zoom ?? 1
+        container.addSubview(w)
+        chat = c
+        panel.keyHandler = { [weak self] e in self?.handleStickyKey(e) ?? false }
+        panel.title = config.title ?? "Chat — \((folder as NSString).lastPathComponent)"
+        c.onTitle = { [weak self] t in
+            guard let self else { return }
+            self.panel.title = t
+            // Kept as the title to show after a restart, until the chat's file is read; a rename comes through too.
+            if let c = self.chat, c.title != "New chat", c.title != self.config.title {
+                self.config.title = c.title
+                self.app?.persist()
+            }
+        }
+        c.onSession = { [weak self] id in
+            self?.config.session = id
+            self?.app?.persist()
+        }
+        c.onSettings = { [weak self] mode, model in
+            self?.config.chatMode = mode
+            self?.config.chatModel = model
+            self?.app?.persist()
+        }
+        c.onActivity = { [weak self] in
+            // New content: refresh the switcher picture once it settles.
+            guard let self else { return }
+            self.thumbnailSoon?.cancel()
+            let job = DispatchWorkItem { [weak self] in
+                if let self, self.panel.isVisible, self.panel.alphaValue > 0 { self.captureThumbnail() }
+            }
+            self.thumbnailSoon = job
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: job)
+        }
+        c.onOpenURL = { [weak self] u in
+            // Like a link that opens a new tab: on top of this sticky's stack, ⌘W comes back.
+            guard let self, let app = self.app, ["http", "https"].contains(u.scheme?.lowercased() ?? "") else {
+                NSWorkspace.shared.open(u)
+                return
+            }
+            let s = app.open(StickyConfig(kind: .web, url: u.absoluteString, frame: self.panel.frame), show: false)
+            app.swap(s, into: self)
+        }
     }
 
     private func setUpNote(in container: NSView) {
@@ -203,7 +276,7 @@ final class HoverView: NSView {
     var isNoteSticky: Bool { isNote && config.noteSticky == true }
     /// The notes window (⌃⌘B), as opposed to stickies.
     var inNotesGroup: Bool { isNote && config.noteSticky != true }
-    var symbolName: String { isWeb ? "globe" : isNote ? "note.text" : "terminal" }
+    var symbolName: String { isWeb ? "globe" : isNote ? "note.text" : isChat ? "bubble.left.and.bubble.right" : "terminal" }
     private var history: [String] = []
     private var historyIndex = 0
 
@@ -214,9 +287,9 @@ final class HoverView: NSView {
 
     private func handleNoteKey(_ e: NSEvent) -> Bool {
         guard let note else { return false }
-        // A note sticky is a sticky too: ⌃Tab switches stickies, ⇧⌘W closes it, ⌘T opens a site.
+        // A note sticky is a sticky too: ⌃Tab switches stickies, ⇧⌘W closes it, ⌘T opens a site, ⌘O a Claude chat.
         if isNoteSticky, let a = Keymap.shared.localAction(for: e, in: .stickies),
-           [.switchStickies, .switchStickiesBack, .closeSticky, .newWebSticky].contains(a) {
+           [.switchStickies, .switchStickiesBack, .closeSticky, .newWebSticky, .openChat].contains(a) {
             return handleStickyKey(e)
         }
         guard let action = Keymap.shared.localAction(for: e, in: .notes) else { return false }
@@ -435,13 +508,15 @@ final class HoverView: NSView {
     var isWeb: Bool { web != nil }
     var webView: WKWebView? { web }
     var isTerminal: Bool { term != nil }
+    var isChat: Bool { chat != nil }
+    var chatView: ChatView? { chat }
     var currentURL: URL? { web?.url ?? URL(string: config.url ?? "") }
 
     /// Name for the switcher and the menu bar list.
     var displayTitle: String {
         let t = panel.title.trimmingCharacters(in: .whitespaces)
         if !t.isEmpty { return t }
-        return currentURL?.host ?? config.command ?? "Sticky"
+        return currentURL?.host ?? config.command ?? config.title ?? "Sticky"
     }
 
     func navigate(to url: URL) {
@@ -451,7 +526,7 @@ final class HoverView: NSView {
         app?.persist()
     }
 
-    /// Sticky keys (⌃Tab switcher, ⇧⌘W, ⌘T, ⌘L, ⌘D, zoom). Other keys go to the page or terminal.
+    /// Sticky keys (⌃Tab switcher, ⇧⌘W, ⌘T, ⌘O, ⌘L, ⌘D, zoom). Other keys go to the page or terminal.
     private func handleStickyKey(_ e: NSEvent) -> Bool {
         guard let a = Keymap.shared.localAction(for: e, in: .stickies) else { return false }
         switch a {
@@ -459,6 +534,7 @@ final class HoverView: NSView {
         case .switchStickiesBack: app?.switchStickies(back: true, holding: e.modifierFlags)
         case .closeSticky: app?.closeForGood(self)
         case .newWebSticky: app?.showSiteLauncher(over: panel, into: nil)
+        case .openChat: app?.showChatPicker(over: self)
         case .openSiteHere:
             guard isWeb else { return false }
             app?.showSiteLauncher(over: panel, into: self)
@@ -467,7 +543,7 @@ final class HoverView: NSView {
             let saved = Sites.shared.toggleSaved(u, title: w.title ?? "")
             flash(saved ? "Saved to your sites" : "Removed from your sites")
         case .zoomIn, .zoomOut, .zoomReset:
-            guard let w = web else { return false }
+            guard let w = web ?? chat?.webView else { return false }
             let steps: [CGFloat] = [0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3]
             let now = w.pageZoom
             switch a {
@@ -506,7 +582,7 @@ final class HoverView: NSView {
 
     /// Takes a small picture of the sticky for the ⌃Tab switcher.
     func captureThumbnail(_ done: (() -> Void)? = nil) {
-        if let w = web {
+        if let w = web ?? chat?.webView {
             let c = WKSnapshotConfiguration()
             c.snapshotWidth = 320
             w.takeSnapshot(with: c) { [weak self] img, _ in
@@ -526,8 +602,9 @@ final class HoverView: NSView {
         }
     }
 
-    /// Is a program (not just the shell prompt) running in this terminal?
+    /// Is a program (not just the shell prompt) running in this terminal? In a chat: is Claude working or asking?
     var hasRunningProgram: Bool {
+        if let c = chat { return c.isBusy }
         guard let t = term, t.process.running else { return false }
         var pids = [pid_t](repeating: 0, count: 64)
         let n = proc_listchildpids(t.process.shellPid, &pids, Int32(pids.count * MemoryLayout<pid_t>.size))
@@ -549,19 +626,21 @@ final class HoverView: NSView {
         note?.saveNow()
         config.hidden = true
         app?.persist()
-        if isWeb {
+        if isWeb || isChat {
             // Looks hidden right away, but stays on screen until the picture is taken:
             // a web view that's off screen can't draw one.
             panel.alphaValue = 0
             panel.ignoresMouseEvents = true
-            var done = false
-            let finish = { [weak self] in
-                guard let self, !done else { return }
-                done = true
+            // Runs once: after the picture, or after 0.6 s if it never comes. Not if it was shown again meanwhile.
+            let finish = DispatchWorkItem { [weak self] in
+                guard let self, self.config.hidden == true, self.panel.isVisible else { return }
                 self.panel.orderOut(nil)
                 self.panel.ignoresMouseEvents = false
             }
-            captureThumbnail(finish)
+            captureThumbnail {
+                finish.perform()
+                finish.cancel()
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: finish)
         } else {
             captureThumbnail()
@@ -577,10 +656,17 @@ final class HoverView: NSView {
         if let t = term { panel.makeFirstResponder(t) }
         if let w = web { panel.makeFirstResponder(w) }
         if let n = note { panel.makeFirstResponder(n.textView) }
+        if let c = chat {
+            panel.makeFirstResponder(c.webView)
+            c.focus()
+        }
         updateAlpha()
     }
 
-    func reload() { web?.reload() }
+    func reload() {
+        web?.reload()
+        chat?.webView.reload()  // the chat page loads again and gets everything from the chat
+    }
 
     private func updateAlpha() {
         guard config.hidden != true else { return }  // mid-hide: stay invisible
@@ -679,6 +765,7 @@ final class HoverView: NSView {
     func windowDidEndLiveResize(_ n: Notification) { saveFrame() }
     func windowWillClose(_ n: Notification) {
         if let t = term, t.process.running { t.process.terminate() }
+        chat?.shutDown()
         note?.saveNow()
         app?.remove(self)
     }
@@ -704,6 +791,7 @@ final class HoverView: NSView {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.accessory)  // menu bar only, no Dock icon
+        signal(SIGPIPE, SIG_IGN)  // writing to a claude that just quit must not quit Sticky
         buildMainMenu()
         buildStatusMenu()
         installHotKeyHandler()
@@ -718,6 +806,13 @@ final class HoverView: NSView {
             if let p = Keymap.shared.problems.first { NSSound.beep(); print("Keybindings: \(p)") }
         }
         enableLoginOnFirstRun()
+        // The chat list (⌘O) and claude's PATH, ready before you need them.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            MainActor.assumeIsolated {
+                ChatIndex.shared.refresh()
+                ClaudeProcess.warmUp()
+            }
+        }
 
         // Load extensions first, so web stickies get them from the first page load.
         Task { @MainActor in
@@ -750,6 +845,13 @@ final class HoverView: NSView {
                 }
             }
         }
+    }
+
+    /// Quitting: chat stickies stop their claude.
+    func applicationWillTerminate(_ n: Notification) {
+        stickies.forEach { $0.chatView?.shutDown() }
+        // stop() finishes on a background queue that may not get to run now, so ask each claude to quit too.
+        for pid in ClaudeProcess.runningPids() { kill(pid, SIGTERM) }
     }
 
     /// One time, from before stacks: stickies swapped into the exact same spot become one stack.
@@ -797,6 +899,8 @@ final class HoverView: NSView {
         stickiesToggleItem = add(m, "Show / Hide Stickies   \(k.shortcut(.toggleAll))", #selector(toggleAll))
         add(m, "New Claude Code Sticky (web)", #selector(newClaudeCodeWeb))
         add(m, "New Claude CLI Sticky…", #selector(newClaude))
+        add(m, "Open Claude Chat…   \(k.shortcut(.openChat))", #selector(showChats))
+        add(m, "New Claude Chat…", #selector(newChat))
         add(m, "New Terminal Sticky…", #selector(newTerminal))
         add(m, "New Web Sticky…   \(k.shortcut(.newWebSticky))", #selector(newWeb))
         add(m, "New Note Sticky", #selector(newNoteSticky))
@@ -975,7 +1079,9 @@ final class HoverView: NSView {
             NSApp.activate(ignoringOtherApps: true)
             let a = NSAlert()
             a.messageText = "Close “\(s.displayTitle)”?"
-            a.informativeText = "A program is still running in it. Closing the sticky stops it. To keep it running, hide it instead (⌘W)."
+            a.informativeText = s.isChat
+                ? "Claude is still working in it (or waiting for your answer, or running a background task). Closing the sticky stops it. To keep it running, hide it instead (⌘W)."
+                : "A program is still running in it. Closing the sticky stops it. To keep it running, hide it instead (⌘W)."
             a.addButton(withTitle: "Close")
             a.addButton(withTitle: "Cancel")
             guard a.runModal() == .alertFirstButtonReturn else { return }
@@ -991,6 +1097,82 @@ final class HoverView: NSView {
         QuickPicker.shared.present(
             placeholder: target == nil ? "Open a site in a new sticky…" : "Open a site in this sticky…",
             items: [], over: parent, rank: { q in Sites.shared.pickerItems(for: q, open: go) })
+    }
+
+    // MARK: Claude chats
+
+    /// ⌘O in a sticky, or the menu bar: every Claude Code chat on this Mac, newest first. The list fills in
+    /// as it refreshes. Over a sticky, the chat opens on top of its stack; a chat a sticky already shows comes up.
+    func showChatPicker(over s: StickyController?) {
+        let picker = QuickPicker.shared
+        picker.present(placeholder: "Search Claude chats…", items: chatItems(over: s), over: s?.panel)
+        let gen = picker.generation
+        ChatIndex.shared.onChange = { [weak self, weak s] in
+            guard let self, picker.generation == gen, picker.isOpen else { return }
+            picker.update(items: self.chatItems(over: s))
+        }
+        ChatIndex.shared.refresh()
+    }
+
+    private static let relativeTime: RelativeDateTimeFormatter = {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .abbreviated
+        return f
+    }()
+
+    private func chatItems(over s: StickyController?) -> [QuickPicker.Item] {
+        var out: [QuickPicker.Item] = []
+        if let c = s?.chatView {
+            let f = c.folder
+            out.append(.init(title: "New chat in \((f as NSString).lastPathComponent)",
+                             subtitle: (f as NSString).abbreviatingWithTildeInPath, key: "new-here") { [weak self, weak s] in
+                self?.openChat(nil, folder: f, title: nil, over: s)
+            })
+        }
+        out.append(.init(title: "New chat in another folder…", key: "new-other") { [weak self, weak s] in
+            guard let self, let f = self.pickFolder() else { return }
+            self.openChat(nil, folder: f, title: nil, over: s)
+        })
+        let live = ChatIndex.liveSessions(ignoring: ClaudeProcess.runningPids())
+        let now = Date()
+        for c in ChatIndex.shared.chats {
+            let name = c.cwd.map { ($0 as NSString).lastPathComponent } ?? ""
+            var detail = Self.relativeTime.localizedString(for: Date(timeIntervalSince1970: c.updated), relativeTo: now)
+            if live[c.id] != nil { detail += " · open in Claude" }
+            if c.archived { detail += " · archived" }
+            // A placeholder title ("New chat") isn't kept, so the chat's own title can show once it has one.
+            let title: String? = c.path.isEmpty && c.title == "New chat" ? nil : c.title
+            let folder = c.cwd ?? NSHomeDirectory()
+            out.append(.init(title: c.title, subtitle: [name, c.lastPrompt].filter { !$0.isEmpty }.joined(separator: " · "),
+                             detail: detail, searchText: [c.cwd ?? "", c.firstPrompt, c.lastPrompt].joined(separator: " "),
+                             key: c.id) { [weak self, weak s] in
+                self?.openChat(c.id, folder: folder, title: title, over: s)
+            })
+        }
+        return out
+    }
+
+    /// Opens a chat (nil: a new one in `folder`). If a sticky already shows it, that one comes up.
+    private func openChat(_ id: String?, folder: String, title: String?, over s: StickyController?) {
+        if let id, let existing = stickies.first(where: { $0.config.kind == .chat && $0.config.session == id }) {
+            raise(existing)
+            return
+        }
+        var c = StickyConfig(kind: .chat, folder: folder, session: id, title: title)
+        if let s, s.isShowing {
+            // Like a link that opens a new tab: on top of that sticky's stack. ⌘W goes back.
+            c.frame = s.panel.frame
+            swap(open(c, show: false), into: s)
+        } else {
+            open(c)
+        }
+    }
+
+    @objc func showChats() { showChatPicker(over: nil) }
+
+    @objc func newChat() {
+        guard let f = pickFolder() else { return }
+        open(StickyConfig(kind: .chat, folder: f))
     }
 
     // Hidden main menu so ⌘C / ⌘V / ⌘W / ⌘R work inside stickies.

@@ -5,8 +5,8 @@ import Carbon
 enum Action: String, CaseIterable {
     // Global (work from any app)
     case toggleNotes, newNoteGlobal, toggleAll, switchStickiesGlobal
-    // Web and terminal stickies
-    case switchStickies, switchStickiesBack, closeSticky, newWebSticky, openSiteHere, saveSite
+    // Web, terminal, chat and note stickies
+    case switchStickies, switchStickiesBack, closeSticky, newWebSticky, openSiteHere, saveSite, openChat
     // Notes window
     case newNote, browseNotes, actionPanel, togglePin, deleteNote, duplicateNote, copyNote
     case revealNote, openInNewSticky, back, forward, nextRecent, prevRecent
@@ -19,9 +19,9 @@ enum Action: String, CaseIterable {
 
     var isGlobal: Bool { [.toggleNotes, .newNoteGlobal, .toggleAll, .switchStickiesGlobal].contains(self) }
 
-    /// Keys that only work in web and terminal stickies.
+    /// Keys that only work in stickies (not the notes window). ⌘O stays in here: never a global hotkey.
     var isStickyOnly: Bool {
-        [.switchStickies, .switchStickiesBack, .closeSticky, .newWebSticky, .openSiteHere, .saveSite].contains(self)
+        [.switchStickies, .switchStickiesBack, .closeSticky, .newWebSticky, .openSiteHere, .saveSite, .openChat].contains(self)
     }
 
     /// Zoom works in both notes and web stickies.
@@ -45,6 +45,7 @@ enum Action: String, CaseIterable {
         case .newWebSticky: return "New Web Sticky"
         case .openSiteHere: return "Open a Site in This Sticky"
         case .saveSite: return "Save / Unsave This Site"
+        case .openChat: return "Open a Claude Chat"
         case .newNote: return "New Note"
         case .browseNotes: return "Browse Notes"
         case .actionPanel: return "Show Actions"
@@ -97,6 +98,7 @@ enum Action: String, CaseIterable {
         case .newWebSticky: return ["cmd+t"]
         case .openSiteHere: return ["cmd+l"]
         case .saveSite: return ["cmd+d"]
+        case .openChat: return ["cmd+o"]
         case .newNote: return ["cmd+n"]
         case .browseNotes: return ["cmd+p"]
         case .actionPanel: return ["cmd+k"]

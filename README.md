@@ -1,11 +1,12 @@
 # Sticky
 
-Floating, always-on-top windows for macOS. Each sticky runs a terminal command or a website, and stays visible over every app — fullscreen apps too, on every desktop.
+Floating, always-on-top windows for macOS. Each sticky runs a terminal command, a website, a note or a Claude Code chat, and stays visible over every app — fullscreen apps too, on every desktop.
 
 ## What it does
 
 - **Claude Code (web) sticky** — opens `claude.ai/code` in a floating window. Turn on Remote Control in the Claude desktop app to drive sessions on your Mac from it.
 - **Claude CLI sticky** — runs `claude` in a folder you pick.
+- **Claude chat sticky** — press **⌘O** in any sticky (or menu bar → **Open Claude Chat…**) to search every Claude Code chat on this Mac, newest first: ones from the terminal, the Claude app and Sticky (the earlier parts of a long Claude app chat show as rows of their own). Pick one and it opens in a clean chat view on top of the sticky's stack (if a sticky already shows it, that one comes up), and you can keep going right there. Claude only starts when you send. It asks before it runs a tool (Allow, Deny, or allow it for the rest of the chat), shows questions and plans as cards, and keeps working while the sticky is hidden. The footer picks the permission mode (Ask first, Accept edits, Plan, Auto) and the model, and shows what the chat cost. Esc stops a reply. Menu bar → **New Claude Chat…** starts one in a folder you pick.
 - **Terminal sticky** — runs any command (`python3`, `htop`, `npm run dev`, …). When it exits you get a normal shell.
 - **Web sticky** — any website. Sign-ins are saved. ⌘- / ⌘= / ⌘0 zoom the page (or pinch), and each sticky remembers its zoom.
 - **Sticky switcher** — hold **⌃** and press **Tab** in any sticky (or **⌥Tab** from any app) to see all your web and terminal stickies with a picture of each, hidden ones too. **Let go** and the one you picked goes on top of the current sticky's stack (see below), like tabs in one window. **Return** opens it as its own window instead. A quick tap swaps back to the last one.
@@ -23,7 +24,7 @@ Floating, always-on-top windows for macOS. Each sticky runs a terminal command o
 
 ## Sticky shortcuts
 
-These work in web, terminal and note stickies (in a note sticky, ⌃Tab switches stickies; use ⌘P to switch notes). All of them can be changed (see **Keybindings** below).
+These work in web, terminal, chat and note stickies (in a note sticky, ⌃Tab switches stickies; use ⌘P to switch notes). All of them can be changed (see **Keybindings** below).
 
 | Action | Keys | Action | Keys |
 |---|---|---|---|
@@ -31,6 +32,7 @@ These work in web, terminal and note stickies (in a note sticky, ⌃Tab switches
 | Hide sticky | ⌘W or the red button | Close sticky for good | ⇧⌘W |
 | New web sticky (site list) | ⌘T | Open a site in this sticky | ⌘L |
 | Save / unsave this site | ⌘D | Zoom in / out / reset | ⌘= / ⌘- / ⌘0 |
+| Open a Claude chat (search them all) | ⌘O | | |
 
 In the switcher: Tab or arrows move, let go of ⌃ to stack it here, Return to open separately (it leaves its stack), **H** hides the highlighted sticky, **W** closes it for good, Esc cancels. The menu bar also lists every sticky, with stacks grouped (the ones waiting behind are indented): click one to show it (on top of its stack) or hide it, or hold ⌥ to close it.
 
@@ -57,7 +59,7 @@ All of these can be changed (see **Keybindings** below).
 
 ## Keybindings
 
-Every shortcut lives in `~/.config/sticky/keybindings.json` (menu bar → **Edit Keybindings…**). Write keys like `"cmd+shift+p"`, `"ctrl+tab"` or `"opt+shift+up"`. Use `""` to turn one off, or a list like `["cmd+p", "cmd+o"]` for several. Changes apply as soon as you save.
+Every shortcut lives in `~/.config/sticky/keybindings.json` (menu bar → **Edit Keybindings…**). Write keys like `"cmd+shift+p"`, `"ctrl+tab"` or `"opt+shift+up"`. Use `""` to turn one off, or a list like `["cmd+p", "cmd+j"]` for several. Changes apply as soon as you save.
 
 ## Extensions (web stickies)
 
@@ -105,12 +107,17 @@ open ~/Applications/Sticky.app
 ## Notes
 
 - **Keychain prompt:** the first time a web sticky saves login data, macOS asks to let Sticky use its "WebCrypto Master Key". WebKit creates this key itself. Click **Always Allow**.
-- **Saved stickies:** `~/Library/Application Support/Sticky/stickies.json`.
+- **Saved stickies:** `~/Library/Application Support/Sticky/stickies.json`. Builds from before chat stickies can't read a list that has one, and save an empty list over it. Before you run an older build, close chat stickies (⇧⌘W), or put back `stickies-backup.json` (next to it, the last list saved with a chat sticky in it) afterwards.
+- **Claude chats stay local:** Sticky reads Claude Code's own chat files (`~/.claude/projects`) and the Claude app's chat titles, and never edits them itself. Sending continues a chat through the `claude` command on this Mac, which adds to that chat's file (or to a copy, see below). Nothing goes through remote control or the cloud.
+  - **Permissions:** Sticky never turns permission checks off (no bypass mode). In **Ask first**, Claude asks before any tool your Claude settings don't already allow (reading files and the like may not ask, as in the terminal). **Accept edits** and **Auto** let it run some tools without asking, as in the CLI. "Always allow" lasts only for that chat, and its button names everything it allows. Claude's settings files are never changed.
+  - **Folder trust:** in a folder Claude Code hasn't been told to trust, Sticky asks first ("Trust … ?"), because a folder's own Claude settings, hooks and MCP servers run when Claude starts there. Your answer is kept in `chat-trust.json`; `~/.claude.json` is only read.
+  - **Open in another Claude:** when you send while the chat is open in another Claude (the app or a terminal), Sticky continues it as a copy, so the two never write into one file. If that happens while Sticky's own reply is still running, it asks you to wait for the reply first.
+  - The ⌘O list is cached in `~/Library/Application Support/Sticky/chat-index.json`, and the chats Sticky started are listed in `chat-own.json` there.
 - **Regular Mac apps can't be floated.** macOS doesn't let one app pin another app's window without disabling System Integrity Protection.
 
 ## Code
 
-Everything is in [`Sources/Sticky/main.swift`](Sources/Sticky/main.swift). The terminal uses [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm).
+Stickies and the app are in [`Sources/Sticky/main.swift`](Sources/Sticky/main.swift). The chat sticky is [`ChatView.swift`](Sources/Sticky/ChatView.swift) (the glue), [`ChatPage.swift`](Sources/Sticky/ChatPage.swift) (the chat page), [`ChatTranscript.swift`](Sources/Sticky/ChatTranscript.swift) (reads one chat file), [`ChatIndex.swift`](Sources/Sticky/ChatIndex.swift) (the ⌘O list) and [`ClaudeProcess.swift`](Sources/Sticky/ClaudeProcess.swift) (runs `claude`). The terminal uses [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm).
 
 ## License
 
