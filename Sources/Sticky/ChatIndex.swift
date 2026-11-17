@@ -316,36 +316,6 @@ struct LiveSession { var pid: Int32; var busy: Bool; var entrypoint: String?; va
         return out
     }
 
-    // MARK: A new chat the Claude app started
-
-    /// The chat the Claude app started in `folder` since `since` (unix seconds) with `text` as its first prompt, if
-    /// its file is there yet. Reads only that folder's chat files changed since then (head and tail, as the list does).
-    nonisolated static func findNewAppChat(folder: String, since: Double, text: String) -> ChatSummary? {
-        let root = projectsDir.path
-        var best: ChatSummary?
-        for name in Set([encode(standard(folder)), encode(realPath(folder))]) {
-            let dir = root + "/" + name
-            for n in (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [] where n.hasSuffix(".jsonl") {
-                let id = String(n.dropLast(6))
-                let path = dir + "/" + n
-                guard !id.isEmpty, !id.hasPrefix("."), let (size, mtime) = Reader.fileInfo(path), mtime >= since - 5,
-                      let s = Reader.readChat(Found(path: path, id: id, folder: name, size: size, mtime: mtime)),
-                      isNewAppChat(s, folder: folder, since: since, text: text) else { continue }
-                if best.map({ ($0.created ?? 0) > (s.created ?? 0) }) ?? true { best = s }  // the first one started
-            }
-        }
-        return best
-    }
-
-    /// A chat the Claude app started (entrypoint claude-desktop) in `folder`, created since `since` (2 s of slack),
-    /// whose first prompt is `text` (as the list cleans it: one line, 200 characters at most).
-    nonisolated static func isNewAppChat(_ s: ChatSummary, folder: String, since: Double, text: String) -> Bool {
-        guard s.entrypoint == "claude-desktop", (s.created ?? s.mtime) >= since - 2, let cwd = s.cwd,
-              Set([standard(cwd), realPath(cwd)]).contains(where: { $0 == standard(folder) || $0 == realPath(folder) }),
-              let want = Reader.clean(text), !s.firstPrompt.isEmpty else { return false }
-        return samePrompt(s.firstPrompt, want)
-    }
-
     // MARK: Folder trust
 
     /// Whether Claude Code trusts this folder already, the way its own check goes: a projects[<path>]

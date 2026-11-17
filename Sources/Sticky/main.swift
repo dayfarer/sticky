@@ -238,7 +238,7 @@ final class HoverView: NSView {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: job)
         }
         c.onFront = { [weak self] in
-            // The Claude app started this new chat (it came forward for that): this sticky comes back on top.
+            // This new chat moved to the Claude app, which came forward to show it: this sticky comes back on top.
             guard let self else { return }
             if let app = self.app { app.raise(self) } else { self.show() }
         }
@@ -1213,7 +1213,7 @@ final class HoverView: NSView {
                 Sticky leaves for that chat, as your own. It reads and writes only Sticky's bridge folder on this Mac, and uses \
                 no network.
 
-                New chats you start in Sticky open in the Claude app, so they're in its list. Chats already open in the app pick up \
+                New chats you start in Sticky move to the Claude app after their first reply, so they're in its list. Chats already open in the app pick up \
                 the mod within a few seconds. Turn this off here any time; that uninstalls the mod.
                 """
             a.addButton(withTitle: "Turn On")
@@ -1222,7 +1222,7 @@ final class HoverView: NSView {
             a.informativeText = """
                 Sticky runs `claude plugin uninstall \(ClaudeSync.pluginId)` and `claude plugin marketplace remove \
                 \(ClaudeSync.marketplace)`, which change Claude Code's user settings, and deletes \(dir). Sticky then sends with \
-                its own claude again, and new chats start in Sticky.
+                its own claude again, and new chats stay in Sticky.
                 """
             a.addButton(withTitle: "Turn Off")
         }

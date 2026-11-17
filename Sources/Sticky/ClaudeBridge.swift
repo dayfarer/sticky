@@ -302,15 +302,62 @@ enum ClaudeBridge {
         installedOverride ?? (NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) != nil)
     }
 
-    /// Letters, digits and -._~ stay; everything else is %-encoded (so "&", "+", "=" and "#" in a message survive).
-    private static let plain = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+    struct HandOff: Sendable {
+        var ok: Bool
+        var message: String
+    }
 
-    /// claude://code/new?q=<text>&folder=<folder>: the app's new-chat page with the message filled in. It never
-    /// sends; the app asks to confirm the folder.
-    static func newChatURL(text: String, folder: String) -> URL? {
-        guard let q = text.addingPercentEncoding(withAllowedCharacters: plain),
-              let f = folder.addingPercentEncoding(withAllowedCharacters: plain) else { return nil }
-        return URL(string: "claude://code/new?q=\(q)&folder=\(f)")
+    /// Tests put a recorder here (they never move a chat into the real app).
+    nonisolated(unsafe) static var handOffOverride: (@Sendable (_ session: String, _ cwd: String) -> HandOff)?
+
+    /// Moves a chat into the Claude app with Claude Code's own handoff, `claude --desktop --resume <id>`, run in the
+    /// chat's folder: the app takes the same chat (same id and file), lists it, and opens it. No claude may have the
+    /// chat open (Sticky's has quit). `--desktop` refuses to run without a terminal, so it runs under script(1) with a
+    /// pseudo-terminal; stdin is closed. At most 30 s. Runs off the main thread.
+    nonisolated static func handOff(session: String, cwd: String) -> HandOff {
+        if let f = handOffOverride { return f(session, cwd) }
+        guard UUID(uuidString: session) != nil else { return HandOff(ok: false, message: "This chat's id isn't one Claude knows.") }
+        guard let exe = ClaudeProcess.findClaude() else {
+            return HandOff(ok: false, message: "Claude Code isn't installed: no `claude` in ~/.local/bin or your PATH.")
+        }
+        var env = ClaudeProcess.environment()
+        if (env["TERM"] ?? "").isEmpty || env["TERM"] == "dumb" { env["TERM"] = "xterm-256color" }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/script")
+        p.arguments = ["-q", "/dev/null", exe, "--desktop", "--resume", session]
+        p.environment = env
+        p.currentDirectoryURL = URL(fileURLWithPath: cwd, isDirectory: true)
+        p.standardInput = FileHandle.nullDevice
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = out
+        let ended = DispatchSemaphore(value: 0)
+        p.terminationHandler = { _ in ended.signal() }
+        let got = Collected()
+        let read = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .utility).async {
+            got.set(out.fileHandleForReading.readDataToEndOfFile())
+            read.signal()
+        }
+        do { try p.run() } catch {
+            try? out.fileHandleForWriting.close()
+            return HandOff(ok: false, message: "Couldn't run claude: \(error.localizedDescription)")
+        }
+        if ended.wait(timeout: .now() + 30) == .timedOut {
+            p.terminate()
+            _ = ended.wait(timeout: .now() + 3)
+        }
+        _ = read.wait(timeout: .now() + 3)
+        // The terminal's colours and control characters out; the last line says what happened.
+        let raw = String(decoding: got.get(), as: UTF8.self)
+        let clean = raw.replacingOccurrences(of: "\\x1B\\[[0-9;?]*[A-Za-z]|\\x1B\\][^\\x07]*\\x07|\\^D|[\\x00-\\x08\\x0B-\\x1F]",
+                                             with: "", options: .regularExpression)
+        let last = clean.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
+            .last { !$0.isEmpty } ?? ""
+        let code = p.isRunning ? -1 : p.terminationStatus
+        if code == 0 { return HandOff(ok: true, message: last) }
+        let why = last.isEmpty ? "claude exited with code \(code)." : String(last.prefix(200))
+        return HandOff(ok: false, message: why.hasSuffix(".") ? why : why + ".")
     }
 
     /// claude://claude.ai/epitaxy/local_<id>: that chat in the Claude app (the link the app's own tools use).

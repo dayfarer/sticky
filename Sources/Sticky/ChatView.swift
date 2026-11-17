@@ -40,7 +40,7 @@ import WebKit
     var onSettings: ((_ mode: String?, _ model: String?) -> Void)?  // you changed the mode or model
     var onActivity: (() -> Void)?          // new content (refresh the switcher picture soon)
     var onOpenURL: ((URL) -> Void)?
-    var onFront: (() -> Void)?             // the Claude app started this new chat: bring the sticky back to the front
+    var onFront: (() -> Void)?             // this new chat moved to the Claude app, which came forward: back on top
     var onTurnOnSync: (() -> Void)?        // the banner's "Turn on Sync with Claude App"
 
     // MARK: State
@@ -114,7 +114,7 @@ import WebKit
     private var cost: String?
     private var error: String?
     private var notice: String?
-    private var startNotice: String?         // why a new chat starts here, not in the Claude app: shown once it starts
+    private var startNotice: String?         // shown once a new claude starts
     private var grantRules: [String] = []    // "Always allow … in this chat" rules: every new claude of this chat gets them
     private var grantDirs: [String] = []     // and the folders granted that way
     private var idleWork: DispatchWorkItem?
@@ -134,9 +134,10 @@ import WebKit
     private var itemsAt = 0.0                // when the file last gained an item (uptime)
     private var appQuiet = false             // the app's turn has run 20 s with nothing new on file
     private var errorActions: [String] = []  // buttons beside `error`
-    private var newChat: NewChatWait?        // the first message waits on the Claude app's new-chat page
-    private var newChatTimer: Timer?
-    private var findingChat = false
+    // A new chat Sticky starts moves to the Claude app once our claude has quit after a reply (claude --desktop).
+    private var handoff: String?             // this chat moves then
+    private var handingOff = false           // claude --desktop --resume runs
+    private var movedAt: Double?             // uptime when it moved: sends wait for the app's lease until moveWait
     private var syncObserver: NSObjectProtocol?
     // The Claude app chat went on under another id (a rewind or /clear there)
     private var appCurrent: String?          // an id seen as the app chat's current part (only that one is followed)
@@ -149,8 +150,7 @@ import WebKit
     private static let idleExit = 3.0        // our claude quits this long after its turn
     private static let ackWait = 10.0        // the Claude app takes a message within this, or it comes back
     private static let quietWait = 20.0      // an app turn with nothing new on file this long: maybe a permission prompt
-    private static let newChatWait = 180.0   // how long to look for the chat the app's new-chat page starts
-    private static let maxNewChatText = 12_000  // the app's link cuts the message at about 14,000 characters
+    private static let moveWait = 15.0       // a chat that moved: the Claude app opens it (and its mod) within this
     private static let lostWait = 10.0       // a message the mod took, with the chat idle this long and no answer: lost
 
     /// Our claude runs a turn, or a message waits for one.
@@ -159,9 +159,9 @@ import WebKit
     private var appBusy: Bool { lease?.busy == true }
     /// Either: the busy dot, Stop, "Working…".
     private var running: Bool { ownRunning || appBusy }
-    /// A new chat whose first message goes to the Claude app's new-chat page: its mode and model are picked there.
-    private var startsInApp: Bool {
-        newChat != nil || (session == nil && !hasFile && process == nil && ClaudeSync.isOn && ClaudeApp.isInstalled)
+    /// Moving this chat to the Claude app, or waiting for the app to open it after the move.
+    private var moving: Bool {
+        handingOff || ((movedAt.map { ProcessInfo.processInfo.systemUptime - $0 < Self.moveWait } ?? false) && lease == nil)
     }
 
     init(session: String?, folder: String, title: String?, mode: String?, model: String?) {
@@ -223,8 +223,6 @@ import WebKit
         timer = nil
         ackTimer?.invalidate()
         ackTimer = nil
-        newChatTimer?.invalidate()
-        newChatTimer = nil
         if let o = syncObserver { NotificationCenter.default.removeObserver(o) }
         syncObserver = nil
         [syncWork, flushWork, idleWork].forEach { $0?.cancel() }
@@ -364,6 +362,11 @@ import WebKit
             sync()
         }
         checkLease()
+        // A chat that moved to the Claude app: the app has it open now, or it took too long. Either way, done.
+        if let m = movedAt, lease != nil || ProcessInfo.processInfo.systemUptime - m >= Self.moveWait {
+            movedAt = nil
+            render(.status)
+        }
         if visible, ticks % 2 == 0 { checkLive() }
         if visible, ticks % 3 == 0 { checkMoved() }
         // A turn in the Claude app with nothing new on file for a while may be waiting on a permission prompt there.
@@ -615,11 +618,7 @@ import WebKit
                            "sub": "Sending here adds to the part before that, which the app no longer shows.",
                            "actions": ["openInClaude", "sendAnyway"].compactMap(Self.action)]
         }
-        if lease == nil, startsInApp { s["locked"] = "Pick them on the Claude app's new-chat page" }
-        if newChat != nil {
-            s["banner"] = ["icon": "app", "text": "Finish in the Claude app: confirm the folder and press Return",
-                           "actions": ["cancelNewChat", "startHere"].compactMap(Self.action)]
-        }
+        if moving { s["banner"] = ["icon": "spin", "text": "Moving this chat to the Claude app…"] }
         return s
     }
 
@@ -651,13 +650,10 @@ import WebKit
         switch id {
         case "openInClaude": return ["id": id, "label": "Open in Claude"]
         case "sendCopy": return ["id": id, "label": "Send as a copy"]
-        case "sendHere": return ["id": id, "label": "Start it here"]
         case "sendAnyway": return ["id": id, "label": "Send here anyway"]
         case "restartSend", "restartCopy": return ["id": id, "label": "Restart and send", "pri": true]
         case "dismissError": return ["id": id, "label": "Cancel"]
         case "turnOnSync": return ["id": id, "label": "Turn on Sync with Claude App"]
-        case "cancelNewChat": return ["id": id, "label": "Cancel"]
-        case "startHere": return ["id": id, "label": "Start here instead", "pri": true]
         default: return nil
         }
     }
@@ -727,15 +723,15 @@ import WebKit
     }
 
     /// Sends a message the way that fits right now (see the top of this file). Returns why it couldn't, or nil;
-    /// "" when a banner says why already. `copy`: the banner's Send as a copy. `here`: never via the Claude app's
-    /// new-chat page, and not after the app chat's newer part either (Send here anyway). `restart`: Restart and send
+    /// "" when a banner says why already. `copy`: the banner's Send as a copy. `here`: not after the app chat's
+    /// newer part (Send here anyway). `restart`: Restart and send
     /// (our claude may be stopped although it runs background tasks).
     private func send(_ text: String, _ images: [(mime: String, base64: String)], copy wantCopy: Bool = false,
                       here: Bool = false, restart again: Bool = false, followed: Bool = false) -> String? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !images.isEmpty else { return "There's nothing to send." }
-        if newChat != nil {
-            // The "Finish in the Claude app" banner says why, and keeps its buttons.
+        if handingOff {
+            // "Moving this chat to the Claude app…": in a moment it goes there.
             post(["op": "nudge"])
             return ""
         }
@@ -745,6 +741,12 @@ import WebKit
             leaseSeq += 1  // a read already on its way is older than this one
             setLease(ClaudeBridge.lease(s))
             if let l = lease { return sendToApp(text, trimmed, images, s, l) }
+            // It just moved to the Claude app, which opens it in a moment: wait for that ("Moving this chat…").
+            if moving {
+                post(["op": "nudge"])
+                render(.status)
+                return ""
+            }
             // 2. Open in another Claude without the mod: nothing is written next to it. The banner says what you can do.
             let other = ChatIndex.liveSessions(ignoring: ClaudeProcess.runningPids())[s]
             setLive(other)
@@ -773,14 +775,6 @@ import WebKit
             }
         }
         if copy, ownRunning { return "Wait for this reply to end, then send it as a copy." }
-        // A new chat starts in the Claude app (with sync on), so it's in the app's list too. Its link carries text only.
-        if session == nil, !hasFile, !copy, !here {
-            if images.isEmpty {
-                if startInApp(trimmed) { return nil }
-            } else if ClaudeSync.isOn, ClaudeApp.isInstalled {
-                startNotice = "Images can't go to the Claude app's new-chat page, so this chat started here."
-            }
-        }
         // 3. Nothing else has it open: Sticky's own claude.
         if let p = process, !stopping {
             // Another Claude may have written to it and gone since our turn, or this goes as a copy: start again.
@@ -968,11 +962,13 @@ import WebKit
             newId = id
             ownTitle = title
         } else {
-            // A new chat, or one whose first message never reached a file.
+            // A new chat, or one whose first message never reached a file. With sync on it moves to the Claude app
+            // once our claude has quit after this reply, so it's in the app's list too.
             let id = session ?? Self.newId()
             o.sessionId = id
             newId = id
             ownTitle = firstText.isEmpty ? nil : Self.oneLine(firstText, 80)
+            if ClaudeSync.isOn, ClaudeApp.isInstalled { handoff = id }
         }
         o.mode = mode
         o.model = model ?? meta.lastModel
@@ -1054,7 +1050,7 @@ import WebKit
 
     private func setMode(_ v: String) {
         // An app chat's is set there, and so is that of a new chat that starts on the app's new-chat page.
-        guard Self.safeModes.contains(v), lease == nil, !startsInApp else { render(.status); return }
+        guard Self.safeModes.contains(v), lease == nil else { render(.status); return }
         mode = v
         process?.setMode(v)
         onSettings?(mode, model)
@@ -1062,7 +1058,7 @@ import WebKit
     }
 
     private func setModel(_ v: String) {
-        guard !v.isEmpty, lease == nil, !startsInApp else { render(.status); return }
+        guard !v.isEmpty, lease == nil else { render(.status); return }
         model = v
         process?.setModel(v)
         onSettings?(mode, model)
@@ -1368,119 +1364,59 @@ import WebKit
             error = nil
             errorActions = []
             render(.status)
-        case "cancelNewChat": cancelNewChat()
-        case "startHere": startHereInstead()
         default: break
         }
     }
 
-    // MARK: A new chat, started in the Claude app
+    // MARK: A new chat moves to the Claude app
 
-    /// With sync on and the Claude app here: opens claude://code/new with the message and this folder (the app
-    /// comes forward and asks to confirm the folder; nothing is sent until you press Return there), then looks for
-    /// the chat it starts. false: start it here instead (images, a message too long for the link, no app).
-    private func startInApp(_ trimmed: String) -> Bool {
-        guard ClaudeSync.isOn, ClaudeApp.isInstalled, Self.isFolder(folder) else { return false }
-        guard trimmed.utf16.count <= Self.maxNewChatText else {
-            startNotice = "This message is too long for the Claude app's new-chat page, so the chat started here."
-            return false
-        }
-        guard let u = ClaudeApp.newChatURL(text: trimmed, folder: folder) else { return false }
-        let since = Date().timeIntervalSince1970
-        guard ClaudeApp.open(u) else {
-            startNotice = "Couldn't open the Claude app, so the chat started here."
-            return false
-        }
-        let id = Self.newId()
-        error = nil
-        errorActions = []
-        pending.append(PendingMessage(id: id, text: trimmed, images: [], state: "app", known: [], app: true))
-        newChat = NewChatWait(id: id, text: trimmed, folder: folder, since: since,
-                              until: ProcessInfo.processInfo.systemUptime + Self.newChatWait)
-        newChatTimer?.invalidate()
-        newChatTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.lookForNewChat() }
-        }
-        render(.pending, .status)
-        return true
-    }
-
-    /// About every second for 3 minutes: has the Claude app started the chat (that folder, since the link opened,
-    /// that first message)?
-    private func lookForNewChat() {
-        guard let w = newChat, !closed else { return }
-        guard ProcessInfo.processInfo.systemUptime < w.until else { return newChatTimedOut() }
-        guard !findingChat else { return }
-        findingChat = true
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let hit = ChatIndex.findNewAppChat(folder: w.folder, since: w.since, text: w.text)
+    /// A new chat Sticky started moves to the Claude app once our claude has quit after a reply, with Claude Code's own
+    /// handoff (`claude --desktop --resume <id>`): same id, same file, and it's in the app's list from then on. The app
+    /// opens it (it shows that chat once) and loads Sticky's mod, so later sends go to it. No folder question, no
+    /// Return to press. If the app came forward, this sticky comes back on top.
+    private func moveToApp() {
+        guard let s = handoff, s == session, !handingOff, process == nil, !closed else { return }
+        handoff = nil
+        guard ClaudeSync.isOn, ClaudeApp.isInstalled else { return }
+        handingOff = true
+        let wasFront = NSApp.isActive
+        let cwd = folder
+        render(.status)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let r = ClaudeApp.handOff(session: s, cwd: cwd)
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
-                    guard let self else { return }
-                    self.findingChat = false
-                    guard let hit, self.newChat?.id == w.id else { return }
-                    self.bindNewChat(hit.id, w)
+                    guard let self, !self.closed else { return }
+                    self.handingOff = false
+                    if r.ok {
+                        self.movedAt = ProcessInfo.processInfo.systemUptime
+                        self.appCurrent = s
+                        self.notice = "This chat is in the Claude app now, too. Sends from here go to it."
+                        ChatIndex.shared.refresh()  // the app's id for it (Open in Claude)
+                        self.checkLease()
+                        if wasFront { self.comeBackSoon() }
+                    } else {
+                        self.error = "Couldn't move this chat to the Claude app: \(r.message) It goes on here."
+                    }
+                    self.render(.status)
                 }
             }
         }
     }
 
-    /// The Claude app started it: this sticky shows that chat from now on (later sends go to the app), and comes
-    /// back to the front with the cursor in its message box.
-    private func bindNewChat(_ id: String, _ w: NewChatWait) {
-        stopWaitingForNewChat()
-        if let k = pending.firstIndex(where: { $0.id == w.id }) {
-            pending[k].state = "sending"
-            pending[k].started = true
-            doneSoon(w.id)
+    /// The Claude app may come forward to show the chat that moved: this sticky comes back on top (only if Sticky was
+    /// in front before, and the app is now).
+    private func comeBackSoon() {
+        for t in [0.5, 1.5] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + t) { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, !self.closed, !NSApp.isActive,
+                          NSWorkspace.shared.frontmostApplication?.bundleIdentifier == ClaudeApp.bundleId else { return }
+                    self.onFront?()
+                    self.focus()
+                }
+            }
         }
-        ChatIndex.shared.refresh()  // the app's title and its own id for the chat (Open in Claude)
-        grantRules = []  // another chat: what "Always allow" granted doesn't come along
-        grantDirs = []
-        appCurrent = id
-        setSession(id)
-        checkLive()
-        syncSoon(0)
-        render(.pending, .status)
-        onFront?()
-        focus()
-    }
-
-    private func stopWaitingForNewChat() {
-        newChat = nil
-        newChatTimer?.invalidate()
-        newChatTimer = nil
-    }
-
-    private func newChatTimedOut() {
-        guard let w = newChat else { return }
-        stopWaitingForNewChat()
-        if let k = pending.firstIndex(where: { $0.id == w.id }) { cancel(k) }  // back in the box
-        error = "The Claude app didn't start this chat in 3 minutes. Send it again, or start it here."
-        errorActions = ["sendHere"]
-        render(.pending, .status)
-    }
-
-    /// Cancel: the message comes back to the composer. (The app's new-chat page stays as it is.)
-    private func cancelNewChat() {
-        guard let w = newChat else { return }
-        stopWaitingForNewChat()
-        if let k = pending.firstIndex(where: { $0.id == w.id }) { cancel(k) }
-        render(.pending, .status)
-    }
-
-    /// Start here instead: Sticky's own claude starts the chat with the message (as before sync).
-    private func startHereInstead() {
-        guard let w = newChat else { return }
-        stopWaitingForNewChat()
-        pending.removeAll { $0.id == w.id }
-        if let e = send(w.text, [], here: true) {
-            // Back in the composer.
-            pending.append(PendingMessage(id: Self.newId(), text: w.text, images: [], state: "sending", known: []))
-            cancel(pending.count - 1)
-            if !e.isEmpty { error = e }
-        }
-        render(.pending, .status)
     }
 
     // MARK: Events from claude
@@ -1585,7 +1521,11 @@ import WebKit
                 if pending[k].started { pending[k].doneAt = syncSeq } else { cancel(k) }
             }
             syncSoon(0)
-            if !restart.isEmpty { restartAfterExit() }
+            if !restart.isEmpty {
+                restartAfterExit()
+            } else if err == nil, let h = handoff, h == session, ChatIndex.findFile(h) != nil {
+                moveToApp()  // a new chat: to the Claude app now that our claude has quit
+            }
             render(.pending, .ghost, .perms, .status)
         }
     }
@@ -1881,15 +1821,6 @@ private struct BridgeSend {
     var otherSince: Double?    // uptime since when another load than a claimer has held the chat, idle
 }
 
-/// A new chat's first message, on the Claude app's new-chat page.
-private struct NewChatWait {
-    var id: String             // its pending bubble
-    var text: String           // trimmed
-    var folder: String
-    var since: Double          // unix seconds when the link opened
-    var until: Double          // uptime when to give up
-}
-
 /// A message you sent that isn't on file yet.
 private struct PendingMessage {
     var id: String             // the uuid claude reports its lifecycle under
@@ -1899,7 +1830,7 @@ private struct PendingMessage {
     var known: Set<String>     // user items already there when it was sent
     var started = false
     var doneAt: Int?           // claude is done with it: gone once a sync after this one has run
-    var app = false            // handed to the Claude app (the bridge, or its new-chat page), not to our claude
+    var app = false            // handed to the Claude app (through the bridge), not to our claude
 
     var js: [String: Any] { ["id": id, "text": text, "images": images, "state": state] }
 }
